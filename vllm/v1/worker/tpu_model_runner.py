@@ -308,7 +308,6 @@ class TPUModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
-            self.encoder_cache.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -323,12 +322,8 @@ class TPUModelRunner:
                 removed_req_indices.append(req_index)
 
         # Free the cached encoder outputs.
-        for req_id, input_id in scheduler_output.free_encoder_input_ids:
-            encoder_outputs = self.encoder_cache.get(req_id)
-            if encoder_outputs is not None:
-                encoder_outputs.pop(input_id, None)
-                if not encoder_outputs:
-                    self.encoder_cache.pop(req_id, None)
+        for mm_hash in scheduler_output.free_encoder_mm_hashes:
+            self.encoder_cache.pop(mm_hash, None)
 
         # Remove the unscheduled requests from the persistent batch.
         # NOTE(woosuk): The unscheduled requests are either preempted requests
@@ -674,15 +669,15 @@ class TPUModelRunner:
         # NOTE (NickLucche) here we diverge from logic in other runners, as we
         # assume to only have whole mm items to process. Hence we avoid the
         # intrinsic dynamism that `scatter_mm_placeholders` introduces.
-        for (req_id, input_id, pos_info), output in zip(
-                req_ids_pos,
+        for (mm_hash, pos_info), output in zip(
+                mm_hashes_pos,
                 encoder_outputs,
         ):
             if req_id not in self.encoder_cache:
                 self.encoder_cache[req_id] = {}
             assert pos_info.is_embed is None, "Expected all positions to be"\
                 " contiguous and embeddings."
-            self.encoder_cache[req_id][input_id] = output
+            self.encoder_cache[mm_hash] = output
 
     def _gather_mm_embeddings(
         self,
@@ -695,6 +690,7 @@ class TPUModelRunner:
             req_state = self.requests[req_id]
             num_computed_tokens = req_state.num_computed_tokens
             mm_positions = req_state.mm_positions
+            mm_hashes = req_state.mm_hashes
             # TODO unroll loop and assume/enforce --disable_chunked_mm_input
             # NOTE (NickLucche) here we diverge from logic in other runners, as
             # we assume to only have whole mm items to process. Hence we avoid
@@ -715,11 +711,13 @@ class TPUModelRunner:
                     # in the decoder's KV cache.
                     continue
 
-                assert req_id in self.encoder_cache
-                assert i in self.encoder_cache[req_id]
+                mm_hash = mm_hashes[i]
+                encoder_output = self.encoder_cache.get(mm_hash, None)
+                assert encoder_output is not None,\
+                      f"Encoder cache miss for {mm_hash}."
                 assert pos_info.is_embed is None, "Expected all positions to"\
                 " be contiguous and embeddings."
-                encoder_output = self.encoder_cache[req_id][i]
+                encoder_output = self.encoder_cache[mm_hash]
                 mm_embeds.append(encoder_output)
         return mm_embeds
 

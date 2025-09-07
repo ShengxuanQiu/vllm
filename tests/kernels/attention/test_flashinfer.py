@@ -395,7 +395,7 @@ def test_flashinfer_decode_with_paged_fp8_kv(
     assert num_query_heads % num_kv_heads == 0
     max_kv_len = max(kv_lens)
     scale = head_size**-0.5
-    use_tensor_cores = (num_query_heads // num_kv_heads) > 4
+    use_tensor_cores = True
     kv_cache_dtype = torch.float8_e4m3fn
 
     query = torch.randn(num_seqs, num_query_heads, head_size, dtype=dtype)

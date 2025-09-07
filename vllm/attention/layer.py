@@ -14,6 +14,7 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group,
                                           is_v1_kv_transfer_group)
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
@@ -22,7 +23,7 @@ from vllm.platforms import _Backend, current_platform
 from vllm.utils import direct_register_custom_op
 
 
-class Attention(nn.Module):
+class Attention(nn.Module, AttentionLayerBase):
     """Attention layer.
 
     This class takes query, key, and value tensors as input. The input tensors
@@ -142,9 +143,7 @@ class Attention(nn.Module):
         # torch.compile works by registering the attention as one giant
         # opaque custom op. For other platforms, we directly call them
         # and let torch.compile handle them.
-        self.use_direct_call = not current_platform.is_cuda_alike(
-        ) and not current_platform.is_cpu()
-
+        self.use_direct_call = not current_platform.opaque_attention_op()
         self.use_output = attn_backend.accept_output_buffer
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -407,6 +406,8 @@ def unified_attention_with_output(
     value: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
+    output_scale: Optional[torch.Tensor] = None,
+    output_block_scale: Optional[torch.Tensor] = None,
 ) -> None:
     wait_for_kv_layer_from_connector(layer_name)
     forward_context: ForwardContext = get_forward_context()
@@ -430,6 +431,8 @@ def unified_attention_with_output_fake(
     value: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
+    output_scale: Optional[torch.Tensor] = None,
+    output_block_scale: Optional[torch.Tensor] = None,
 ) -> None:
     return
 
@@ -437,7 +440,7 @@ def unified_attention_with_output_fake(
 direct_register_custom_op(
     op_name="unified_attention_with_output",
     op_func=unified_attention_with_output,
-    mutates_args=["output"],
+    mutates_args=["output", "output_block_scale"],
     fake_impl=unified_attention_with_output_fake,
     dispatch_key=current_platform.dispatch_key,
 )

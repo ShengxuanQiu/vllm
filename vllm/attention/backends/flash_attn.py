@@ -669,6 +669,8 @@ class FlashAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
         output: Optional[torch.Tensor] = None,
+        output_scale: Optional[torch.Tensor] = None,
+        output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
 
@@ -677,7 +679,8 @@ class FlashAttentionImpl(AttentionImpl):
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
             output: shape = [num_tokens, num_heads, head_size]
-            kv_cache = [2, num_blocks, block_size, num_kv_heads, head_size]
+            kv_cache: KV cache tensor with shape
+                [2, num_blocks, block_size, num_kv_heads, head_size].
                 NOTE: kv_cache will be an empty tensor with shape [0]
                 for profiling run.
             attn_metadata: Metadata for attention.
@@ -687,6 +690,8 @@ class FlashAttentionImpl(AttentionImpl):
               We use torch's .expand() to avoid duplicating values
         """
         assert output is not None, "Output tensor must be provided."
+        if output_scale is not None or output_block_scale is not None:
+            raise ValueError("FlashAttention does not support output scaling.")
 
         # NOTE(woosuk): FlashAttention2 does not support FP8 KV cache.
         if not flash_attn_supports_fp8() or output.dtype != torch.bfloat16:
@@ -917,7 +922,7 @@ class FlashAttentionImpl(AttentionImpl):
 
 
 def _get_query_key_seq_metadata(
-    attn_metadata,
+    attn_metadata: FlashAttentionMetadata,
     is_prompt: bool,
     attn_type: str,
 ) -> tuple:

@@ -105,6 +105,7 @@ datasets==3.0.2
     #   lm-eval
 decorator==5.1.1
     # via librosa
+decord==0.6.0
 dill==0.3.8
     # via
     #   datasets
@@ -264,8 +265,7 @@ librosa==0.10.2.post1
     # via -r requirements/test.in
 llvmlite==0.44.0
     # via numba
-lm-eval==0.4.8
-    # via -r requirements/test.in
+lm-eval @ git+https://github.com/EleutherAI/lm-evaluation-harness.git@206b7722158f58c35b7ffcd53b035fdbdda5126d
 lxml==5.3.0
     # via
     #   blobfile
@@ -329,6 +329,7 @@ numpy==1.26.4
     #   contourpy
     #   cupy-cuda12x
     #   datasets
+    #   decord
     #   einx
     #   encodec
     #   evaluate
@@ -477,7 +478,7 @@ pycparser==2.22
     # via cffi
 pycryptodomex==3.22.0
     # via blobfile
-pydantic==2.9.2
+pydantic==2.11.7
     # via
     #   datamodel-code-generator
     #   mistral-common
@@ -737,7 +738,7 @@ tqdm==4.66.6
     #   transformers
 tqdm-multiprocess==0.0.11
     # via lm-eval
-transformers==4.51.3
+transformers==4.55.2
     # via
     #   -r requirements/test.in
     #   genai-perf

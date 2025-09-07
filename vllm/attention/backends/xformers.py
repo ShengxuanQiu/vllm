@@ -431,6 +431,8 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         kv_cache: torch.Tensor,
         attn_metadata: "XFormersMetadata",
         output: Optional[torch.Tensor] = None,
+        output_scale: Optional[torch.Tensor] = None,
+        output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with xFormers and PagedAttention.
 
@@ -469,20 +471,25 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 max_encoder_seq_len)
     
         Args:
+            layer: The attention layer.
             query: shape = [num_tokens, num_heads * head_size]
             key: shape = [num_tokens, num_kv_heads * head_size]
             value: shape = [num_tokens, num_kv_heads * head_size]
-            kv_cache = [2, num_blocks, block_size * num_kv_heads * head_size]
+            kv_cache: KV cache tensor with shape 
+                [2, num_blocks, block_size * num_kv_heads * head_size].
                 NOTE: kv_cache will be an empty tensor with shape [0]
                 for profiling run.
             attn_metadata: Metadata for attention.
-            attn_type: Select attention type, between encoder attention,
-                       decoder self-attention, or encoder/decoder cross-
-                       attention. Defaults to decoder self-attention,
-                       which is the vLLM default generally
+            output: Optional output tensor.
+            output_scale: Optional scale tensor for output quantization.
+            output_block_scale: Optional block scale tensor for output
         Returns:
-            shape = [num_tokens, num_heads * head_size]
+            shape = [num_tokens, num_heads * head_size]    
         """
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError(
+                 "fused output quantization is not yet supported"
+                 " for XFormersImpl")
         attn_type = self.attn_type
         # Check that appropriate attention metadata attributes are
         # selected for the desired attention type
@@ -637,7 +644,6 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         for API spec.
 
         Args:
-            output: shape = [num_prefill_tokens, num_heads, head_size]
             query: shape = [num_prefill_tokens, num_heads, head_size]
             key: shape = [num_prefill_tokens, num_kv_heads, head_size]
             value: shape = [num_prefill_tokens, num_kv_heads, head_size]

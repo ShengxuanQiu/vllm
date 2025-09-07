@@ -5,6 +5,8 @@ from typing import Dict, List, Optional, Type
 
 from vllm.model_executor.layers.quantization.kernels.scaled_mm.aiter import (
     AiterScaledMMLinearKernel)
+from vllm.model_executor.layers.quantization.kernels.scaled_mm.cpu import (
+    CPUScaledMMLinearKernel)
 from vllm.model_executor.layers.quantization.kernels.scaled_mm.cutlass import (
     CutlassScaledMMLinearKernel)
 from vllm.model_executor.layers.quantization.kernels.scaled_mm.ScaledMMLinearKernel import (  # noqa: E501

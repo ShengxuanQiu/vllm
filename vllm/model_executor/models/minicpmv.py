@@ -56,7 +56,8 @@ from vllm.multimodal.parse import (DictEmbeddingItems, ImageItem,
                                    VideoItem, VideoProcessorItems)
 from vllm.multimodal.processing import (BaseMultiModalProcessor,
                                         BaseProcessingInfo, PromptReplacement,
-                                        PromptUpdate, PromptUpdateDetails)
+                                        PromptUpdate, PromptUpdateDetails,
+                                        ResolvedPromptUpdate, _seq2text)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors

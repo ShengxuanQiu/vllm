@@ -46,7 +46,7 @@ from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLProcessingInfo, Qwen2_5_VLVideoEmbeddingInputs,
     Qwen2_5_VLVideoInputs, Qwen2_5_VLVideoPixelInputs)
 from vllm.model_executor.models.qwen2_audio import (
-    Qwen2AudioInputs, Qwen2AudioProcessingInfo,
+    Qwen2AudioFeatureInputs, Qwen2AudioProcessingInfo,
     _get_feat_extract_output_lengths)
 from vllm.model_executor.models.qwen2_vl import Qwen2VLMultiModalDataParser
 from vllm.model_executor.sampling_metadata import SamplingMetadata
@@ -119,7 +119,8 @@ class Qwen2_5OmniThinkerMultiModalDataParser(Qwen2VLMultiModalDataParser):
                 required_fields={
                     "input_audio_features", "audio_feature_lengths"
                 },
-                fields_factory=_qwen2_5_omni_thinker_field_config,
+                fields_factory=create_qwen2_5_omni_thinker_field_factory(
+                    self._spatial_merge_size),
             )
 
         return super()._parse_audio_data(data)
@@ -234,6 +235,8 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
     def _get_data_parser(self) -> MultiModalDataParser:
         feature_extractor = self.info.get_feature_extractor()
         return Qwen2_5OmniThinkerMultiModalDataParser(
+            spatial_merge_size=self.info.get_hf_config(
+            ).vision_config.spatial_merge_size,
             target_sr=feature_extractor.sampling_rate)
 
     def _call_hf_processor(
@@ -275,7 +278,9 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        return _qwen2_5_omni_thinker_field_config(hf_inputs)
+        return create_qwen2_5_omni_thinker_field_factory(
+            self.info.get_hf_config().vision_config.spatial_merge_size)(
+                hf_inputs)
 
     def _maybe_apply_prompt_updates(
         self,
@@ -304,9 +309,8 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
 
         if is_update_applied:
             mm_placeholders = self._find_mm_placeholders(
-                mm_prompt_updates,
                 prompt_ids,
-                mm_item_counts,
+                mm_prompt_updates,
             )
             self._validate_mm_placeholders(
                 mm_placeholders,
@@ -323,7 +327,6 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
             ) = self._apply_prompt_updates(
                 prompt_ids,
                 mm_prompt_updates,
-                mm_item_counts,
             )
             self._validate_mm_placeholders(
                 mm_placeholders,
@@ -528,7 +531,7 @@ class Qwen2_5OmniConditionalGenerationMixin:
             return torch.concat(mm_input, dim=dim)
 
     def _parse_and_validate_audio_input(
-            self, **kwargs: object) -> Optional[Qwen2AudioInputs]:
+            self, **kwargs: object) -> Optional[Qwen2AudioFeatureInputs]:
         input_audio_features = kwargs.pop('input_audio_features', None)
         audio_feature_lengths = kwargs.pop('audio_feature_lengths', None)
         feature_attention_mask = kwargs.pop('feature_attention_mask', None)
@@ -542,9 +545,10 @@ class Qwen2_5OmniConditionalGenerationMixin:
         if not isinstance(input_audio_features, (torch.Tensor, list)):
             raise ValueError("Incorrect type of audio input features. "
                              f"Got type: {type(input_audio_features)}")
-        return Qwen2AudioInputs(input_features=input_audio_features,
-                                audio_feature_lengths=audio_feature_lengths,
-                                feature_attention_mask=feature_attention_mask)
+        return Qwen2AudioFeatureInputs(
+            input_features=input_audio_features,
+            audio_feature_lengths=audio_feature_lengths,
+            feature_attention_mask=feature_attention_mask)
 
     def _parse_and_validate_image_input(
         self,

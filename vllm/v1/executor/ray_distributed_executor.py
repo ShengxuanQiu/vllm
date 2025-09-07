@@ -36,7 +36,7 @@ class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
 
     def execute_model(
         self,
-        scheduler_output,
+        scheduler_output: SchedulerOutput,
     ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
         """Execute the model on the Ray workers.
 

@@ -25,8 +25,10 @@ logger = init_logger(__name__)
 class GGUFConfig(QuantizationConfig):
     """Config class for GGUF."""
 
-    def __init__(self, ) -> None:
+    def __init__(self,
+                 unquantized_modules: Optional[list[str]] = None) -> None:
         super().__init__()
+        self.unquantized_modules = unquantized_modules or []
 
     def __repr__(self) -> str:
         return ("GGUFConfig()")
@@ -52,12 +54,18 @@ class GGUFConfig(QuantizationConfig):
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> Optional["QuantizeMethodBase"]:
         if isinstance(layer, LinearBase):
+            if is_layer_skipped_gguf(prefix, self.unquantized_modules):
+                return UnquantizedLinearMethod()
             return GGUFLinearMethod(self)
         elif isinstance(layer, VocabParallelEmbedding):
             return GGUFEmbeddingMethod(self)
         elif isinstance(layer, FusedMoE):
             return GGUFMoEMethod(self)
         return None
+
+
+def is_layer_skipped_gguf(prefix: str, unquantized_modules: list[str]):
+    return any(module_name in prefix for module_name in unquantized_modules)
 
 
 UNQUANTIZED_TYPES = {WeightType.F32, WeightType.F16, WeightType.BF16}

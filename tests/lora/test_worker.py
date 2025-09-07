@@ -29,18 +29,11 @@ def v1(run_with_both_engines_lora):
 @patch.dict(os.environ, {"RANK": "0"})
 def test_worker_apply_lora(sql_lora_files):
 
-    def set_active_loras(worker: Union[Worker, V1Worker],
-                         lora_requests: list[LoRARequest]):
+    def set_active_loras(worker: Worker, lora_requests: list[LoRARequest]):
         lora_mapping = LoRAMapping([], [])
-        if isinstance(worker, Worker):
-            # v0 case
-            worker.model_runner.set_active_loras(lora_requests, lora_mapping)
-        else:
-            # v1 case
-            worker.model_runner.lora_manager.set_active_adapters(
-                lora_requests, lora_mapping)
 
-    worker_cls = V1Worker if envs.VLLM_USE_V1 else Worker
+        worker.model_runner.lora_manager.set_active_adapters(
+            lora_requests, lora_mapping)
 
     vllm_config = VllmConfig(
         model_config=ModelConfig(

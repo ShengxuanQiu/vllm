@@ -144,6 +144,37 @@ def run_deepseek_vl2(questions: list[str], modality: str) -> ModelRequestData:
     )
 
 
+# Ernie4.5-VL
+def run_ernie45_vl(questions: list[str], modality: str) -> ModelRequestData:
+    model_name = "baidu/ERNIE-4.5-VL-28B-A3B-PT"
+
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=4096,
+        max_num_seqs=5,
+        limit_mm_per_prompt={modality: 1},
+        trust_remote_code=True,
+    )
+
+    if modality == "image":
+        placeholder = "Picture 1:<|IMAGE_START|><|image@placeholder|><|IMAGE_END|>"
+    elif modality == "video":
+        placeholder = "Video 1:<|VIDEO_START|><|video@placeholder|><|VIDEO_END|>"
+
+    prompts = [
+        (
+            f"<|begin_of_sentence|>User: {question}{placeholder}\n"
+            "Assistant: <think></think>"
+        )
+        for question in questions
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
 # Florence2
 def run_florence2(questions: list[str], modality: str) -> ModelRequestData:
     assert modality == "image"
@@ -974,6 +1005,28 @@ def run_qwen2_5_omni(questions: list[str], modality: str):
                 f"<|im_start|>user\n<|vision_bos|>{placeholder}<|vision_eos|>"
                 f"{question}<|im_end|>\n"
                 "<|im_start|>assistant\n") for question in questions]
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
+# R-4B
+def run_r_vl(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "image"
+    model_name = "YannQi/R-4B"
+
+    prompts = [
+        f"<|im_start|>user <image>\n{question}<|im_end|><|im_start|>assistant\n"
+        for question in questions
+    ]
+
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=16384,
+        limit_mm_per_prompt={modality: 1},
+    )
+
     return ModelRequestData(
         engine_args=engine_args,
         prompts=prompts,

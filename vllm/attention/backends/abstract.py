@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Optional,
                     Protocol, Set, Tuple, Type, TypeVar)
-
+from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 import torch
 
 from vllm.multimodal import MultiModalPlaceholderMap
@@ -282,9 +282,12 @@ class AttentionImpl(ABC, Generic[T]):
         kv_cache: torch.Tensor,
         attn_metadata: T,
         output: Optional[torch.Tensor] = None,
+        output_scale: Optional[torch.Tensor] = None,
+        output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         raise NotImplementedError
-
+    def fused_output_quant_supported(self, quant_key: QuantKey):
+        return False
 
 class MLAAttentionImpl(AttentionImpl[T], Generic[T]):
 
@@ -298,6 +301,8 @@ class MLAAttentionImpl(AttentionImpl[T], Generic[T]):
         kv_cache: torch.Tensor,
         attn_metadata: T,
         output: Optional[torch.Tensor] = None,
+        output_scale: Optional[torch.Tensor] = None,
+        output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 

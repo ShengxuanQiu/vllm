@@ -780,11 +780,9 @@ class LLM:
             lora_request=lora_request,
         )
 
-    @overload
     def encode(
         self,
         prompts: Union[PromptType, Sequence[PromptType]],
-        /,
         pooling_params: Optional[Union[PoolingParams,
                                        Sequence[PoolingParams]]] = None,
         *,

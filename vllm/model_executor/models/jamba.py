@@ -153,10 +153,10 @@ class JambaMambaDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
 
-        hidden_states = self.mamba(hidden_states, mamba_cache_params)
+        output = torch.empty_like(hidden_states)
+        self.mamba(hidden_states, output, mamba_cache_params)
         # Fully Connected
-        hidden_states, residual = self.pre_ff_layernorm(
-            hidden_states, residual)
+        hidden_states, residual = self.pre_ff_layernorm(output, residual)
         hidden_states = self.feed_forward(hidden_states)
         return hidden_states, residual
 
@@ -266,6 +266,7 @@ ALL_DECODER_LAYER_TYPES = {
 }
 
 
+@support_torch_compile
 class JambaModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):

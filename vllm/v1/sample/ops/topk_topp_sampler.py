@@ -71,10 +71,12 @@ class TopKTopPSampler(nn.Module):
                     "native implementation of top-p & top-k sampling. For the "
                     "best performance, please install FlashInfer.")
                 self.forward = self.forward_native
-        elif current_platform.is_tpu():
-            self.forward = self.forward_tpu
         else:
             self.forward = self.forward_native
+        if current_platform.is_tpu():
+            self.apply_top_k_top_p = apply_top_k_top_p_tpu
+        else:
+            self.apply_top_k_top_p = apply_top_k_top_p
 
     def forward_native(
         self,
@@ -82,15 +84,20 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: Optional[torch.Tensor],
         p: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         PyTorch-native implementation of top-k and top-p sampling.
 
         The logits tensor may be updated in-place.
         """
-        logits = apply_top_k_top_p(logits, k, p)
+        logits = self.apply_top_k_top_p(logits, k, p)
+        logits_to_return = None
+        if self.logprobs_mode == LogprobsMode.PROCESSED_LOGITS:
+            logits_to_return = logits
+        elif self.logprobs_mode == LogprobsMode.PROCESSED_LOGPROBS:
+            logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
         probs = logits.softmax(dim=-1, dtype=torch.float32)
-        return random_sample(probs, generators)
+        return random_sample(probs, generators), logits_to_return
 
     def forward_cuda(
         self,

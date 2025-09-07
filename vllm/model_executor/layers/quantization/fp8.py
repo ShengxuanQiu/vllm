@@ -9,6 +9,7 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 import vllm.envs as envs
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -338,6 +339,8 @@ class Fp8LinearMethod(LinearMethodBase):
             # Update the layer with the new values.
             layer.weight = Parameter(qweight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+            # layer.input_scale is None indicates dynamic quant and scale is
+            # computed from input.
             layer.input_scale = None
 
         # If checkpoint is fp8, handle that there are N scales for N

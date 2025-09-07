@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import (Callable, Generator, ItemsView, Iterable, Mapping,
                              Sequence)
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
 from typing import (TYPE_CHECKING, Generic, NamedTuple, Optional, Protocol,
@@ -41,10 +41,59 @@ PromptSeq = Union[str, list[int]]
 """A token sequence (list of token IDs) or text."""
 
 
+@lru_cache(maxsize=2048)
+def _cached_encode(
+    tokenizer: AnyTokenizer,
+    text: str,
+    *,
+    add_special_tokens: Optional[bool] = None,
+) -> list[int]:
+    return encode_tokens(tokenizer,
+                         text,
+                         add_special_tokens=add_special_tokens)
+
+
+@lru_cache(maxsize=2048)
+def _cached_decode(
+    tokenizer: AnyTokenizer,
+    token_ids: tuple[int, ...],
+    *,
+    skip_special_tokens: Optional[bool] = None,
+) -> str:
+    return decode_tokens(tokenizer,
+                         list(token_ids),
+                         skip_special_tokens=skip_special_tokens)
+
+
+def _seq2text(tokenizer: AnyTokenizer, seq: PromptSeq) -> str:
+    if isinstance(seq, str):
+        return seq
+
+    return _cached_decode(tokenizer, tuple(seq))
+
+
+def _seq2tokens(tokenizer: AnyTokenizer, seq: PromptSeq) -> list[int]:
+    if isinstance(seq, str):
+        return _cached_encode(tokenizer, seq, add_special_tokens=False)
+
+    return seq
+
+
+class _GetMatchIndex(Protocol):
+
+    def __call__(
+        self,
+        tokenizer: AnyTokenizer,
+        prompt: PromptSeq,
+        start_idx: int = 0,
+    ) -> Optional[int]:
+        ...
+
+
 @dataclass
 class PromptIndex:
     """Resolves to an index in the prompt."""
-    get_match_index: Callable[[AnyTokenizer, PromptSeq], Optional[int]]
+    get_match_index: _GetMatchIndex
 
 
 class PromptIndexTargets:
@@ -56,7 +105,7 @@ class PromptIndexTargets:
 
         This results in a match even if the prompt is empty.
         """
-        return PromptIndex(lambda tok, prompt: 0)
+        return PromptIndex(lambda tokenizer, prompt, start_idx=0: 0)
 
     @staticmethod
     def prefix(seq: PromptSeq) -> PromptIndex:
@@ -67,7 +116,11 @@ class PromptIndexTargets:
         def get_match_index(
             tokenizer: AnyTokenizer,
             prompt: PromptSeq,
+            start_idx: int = 0,
         ) -> Optional[int]:
+            if start_idx != 0:
+                return None
+
             prefix = seq
 
             if isinstance(prompt, str):
@@ -93,12 +146,22 @@ class PromptIndexTargets:
 
         This results in a match even if the prompt is empty.
         """
-        return PromptIndex(lambda tok, prompt: len(prompt))
+        return PromptIndex(lambda tokenizer, prompt, start_idx=0: len(prompt))
 
 
-PromptTarget = Union[PromptSeq, PromptIndex]
+UpdateTarget = Union[PromptSeq, PromptIndex]
 """
 The token sequence or text to update.
+"""
+
+PromptUpdateTarget = Union[Callable[[int], UpdateTarget], UpdateTarget]
+"""
+Given the index of the processed item within
+[`modality`][vllm.multimodal.processing.PromptUpdate.modality],
+output the corresponding token sequence (or text).
+
+For convenience, you can directly pass in the token sequence (or text)
+instead of a function if it does not depend on the input.
 """
 
 
@@ -130,11 +193,12 @@ class PromptUpdateDetails(Generic[_S]):
         embed_text: str,
     ) -> "PromptUpdateDetails[_S]":
 
-        def is_embed(full: "_BoundPromptSequence") -> torch.Tensor:
-            embed_token_ids = encode_tokens(full.tokenizer, embed_text)
+        def is_embed(tokenizer: AnyTokenizer, full: PromptSeq) -> torch.Tensor:
+            embed_token_ids = encode_tokens(tokenizer, embed_text)
+            token_ids = _seq2tokens(tokenizer, full)
 
             return torch.isin(
-                torch.tensor(full.token_ids),
+                torch.tensor(token_ids),
                 torch.tensor(embed_token_ids),
             )
 
@@ -145,10 +209,13 @@ class PromptUpdateDetails(Generic[_S]):
         seq: _S,
         embed_token_id: int,
     ) -> "PromptUpdateDetails[_S]":
-        return PromptUpdateDetails(
-            full=seq,
-            is_embed=lambda f: torch.tensor(f.token_ids) == embed_token_id,
-        )
+
+        def is_embed(tokenizer: AnyTokenizer, full: PromptSeq) -> torch.Tensor:
+            token_ids = _seq2tokens(tokenizer, full)
+
+            return torch.tensor(token_ids) == embed_token_id
+
+        return PromptUpdateDetails(full=seq, is_embed=is_embed)
 
 
 PromptUpdateInfo = Union[PromptSeq, PromptUpdateDetails]
@@ -184,7 +251,7 @@ class PromptUpdate(ABC):
     modality: str
     """The modality for which the update is made."""
 
-    target: PromptTarget
+    target: PromptUpdateTarget
     """The token sequence (or text) to update."""
 
     @property
@@ -199,10 +266,35 @@ class PromptUpdate(ABC):
         """Defines how to update the prompt."""
         raise NotImplementedError
 
-    def bind(self, tokenizer: AnyTokenizer) -> "BoundPromptUpdate":
-        return BoundPromptUpdate(
-            _origin=self,
-            tokenizer=tokenizer,
+    def _resolve_target(self, item_idx: int) -> UpdateTarget:
+        target = self.target
+        if callable(target):
+            target = target(item_idx)
+
+        return target
+
+    def _resolve_content(self, item_idx: int) -> PromptUpdateDetails:
+        content = self.content
+        if callable(content):
+            content = content(item_idx)
+
+        if not isinstance(content, PromptUpdateDetails):
+            content = PromptUpdateDetails.from_seq(content)
+
+        return content
+
+    def resolve(self, item_idx: int) -> "ResolvedPromptUpdate":
+        """
+        Given the index of the processed item within
+        [`modality`][vllm.multimodal.processing.PromptUpdate.modality],
+        output a copy of this object with its lazy attributes resolved.
+        """
+        return ResolvedPromptUpdate(
+            modality=self.modality,
+            item_idx=item_idx,
+            mode=self.mode,
+            target=self._resolve_target(item_idx),
+            content=self._resolve_content(item_idx),
         )
 
 
@@ -343,30 +435,6 @@ class PromptReplacement(PromptUpdate):
     @property
     def mode(self) -> UpdateMode:
         return UpdateMode.REPLACE
-
-
-@lru_cache(maxsize=2048)
-def _cached_encode(
-    tokenizer: AnyTokenizer,
-    text: str,
-    *,
-    add_special_tokens: Optional[bool] = None,
-) -> list[int]:
-    return encode_tokens(tokenizer,
-                         text,
-                         add_special_tokens=add_special_tokens)
-
-
-@lru_cache(maxsize=2048)
-def _cached_decode(
-    tokenizer: AnyTokenizer,
-    token_ids: tuple[int, ...],
-    *,
-    skip_special_tokens: Optional[bool] = None,
-) -> str:
-    return decode_tokens(tokenizer,
-                         list(token_ids),
-                         skip_special_tokens=skip_special_tokens)
 
 
 class _HasModalityAttr(Protocol):
@@ -526,7 +594,6 @@ def iter_token_matches(
     if match_len == 0:
         return
 
-    start_idx = 0
     while start_idx < prompt_len - match_len + 1:
         end_idx = start_idx + match_len
 
@@ -564,68 +631,6 @@ def replace_token_matches(
     out_seqs.append(token_ids[prev_end_idx:])
 
     return flatten_2d_lists(out_seqs)
-
-
-@dataclass(repr=False)
-class PromptTargetMatch(ABC):
-    _origin: BoundPromptUpdate
-
-    @property
-    def modality(self) -> str:
-        return self._origin.modality
-
-    @property
-    @abstractmethod
-    def start_idx(self) -> int:
-        raise NotImplementedError
-
-    @property
-    @abstractmethod
-    def end_idx(self) -> int:
-        raise NotImplementedError
-
-    def __repr__(self) -> str:
-        return (f"{type(self).__name__}(modality={self.modality!r}, "
-                f"start_idx={self.start_idx!r}, end_idx={self.end_idx!r})")
-
-
-@dataclass(repr=False)
-class _PromptTargetIndexMatch(PromptTargetMatch):
-    match_idx: int
-
-    @property
-    def start_idx(self) -> int:
-        return self.match_idx
-
-    @property
-    def end_idx(self) -> int:
-        return self.match_idx
-
-
-@dataclass(repr=False)
-class _PromptTargetTokenMatch(PromptTargetMatch):
-    match: _TokenMatch
-
-    @property
-    def start_idx(self) -> int:
-        return self.match.start_idx
-
-    @property
-    def end_idx(self) -> int:
-        return self.match.end_idx
-
-
-@dataclass(repr=False)
-class _PromptTargetTextMatch(PromptTargetMatch):
-    match: re.Match[str]
-
-    @property
-    def start_idx(self) -> int:
-        return self.match.start()
-
-    @property
-    def end_idx(self) -> int:
-        return self.match.end()
 
 
 @dataclass
@@ -818,6 +823,8 @@ def _iter_placeholders(
     Note that empty matches are ignored.
     """
     prompt_len = len(prompt)
+    mm_item_counts = {m: len(items) for m, items in mm_prompt_updates.items()}
+
     item_idx_by_modality = defaultdict[str, int](lambda: 0)
 
     start_idx = 0
@@ -829,9 +836,9 @@ def _iter_placeholders(
             if item_idx >= mm_item_counts.get(modality, 0):
                 continue
 
-            for update_info in modality_updates:
-                content = update_info.get_content(item_idx)
-                content_tokens_full = content.full.token_ids
+            for update in modality_updates[item_idx]:
+                content = update.content
+                content_tokens_full = _seq2tokens(tokenizer, content.full)
                 content_len_full = len(content_tokens_full)
                 end_idx_full = start_idx + content_len_full
 
@@ -841,7 +848,8 @@ def _iter_placeholders(
                 if prompt[start_idx:end_idx_full] == content_tokens_full:
                     content_is_embed = content.is_embed
                     if content_is_embed is not None:
-                        content_is_embed = content_is_embed(content.full)
+                        content_is_embed = content_is_embed(
+                            tokenizer, content.full)
 
                     yield PlaceholderFeaturesInfo(
                         modality=modality,
@@ -1080,8 +1088,13 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         prompt: str,
         mm_data: MultiModalDataDict,
         hf_processor_mm_kwargs: Mapping[str, object],
+        *,
+        mm_hash_overrides: Optional[MultiModalHashes] = None,
     ) -> MultiModalInputs:
-        return self.apply(prompt, mm_data, hf_processor_mm_kwargs)
+        return self.apply(prompt,
+                          mm_data,
+                          hf_processor_mm_kwargs,
+                          mm_hash_overrides=mm_hash_overrides)
 
     def _get_data_parser(self) -> MultiModalDataParser:
         """
@@ -1156,14 +1169,60 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         """
         raise NotImplementedError
 
+    def _bind_and_group_updates(
+        self,
+        prompt_updates: Sequence[PromptUpdate],
+        mm_item_counts: Mapping[str, int],
+    ) -> MultiModalPromptUpdates:
+        return {
+            modality: [[update.resolve(item_idx) for update in updates]
+                       for item_idx in range(mm_item_counts.get(modality, 0))]
+            for modality, updates in full_groupby_modality(prompt_updates)
+        }
+
+    def _get_mm_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> MultiModalPromptUpdates:
+        unbound_prompt_updates = self._get_prompt_updates(
+            mm_items=mm_items,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            out_mm_kwargs=out_mm_kwargs,
+        )
+
+        mm_prompt_updates = self._bind_and_group_updates(
+            unbound_prompt_updates,
+            mm_items.get_all_counts(),
+        )
+
+        for modality, prompt_updates in mm_prompt_updates.items():
+            for item_idx, item_prompt_updates in enumerate(prompt_updates):
+                if len(item_prompt_updates) > 1:
+                    logger.warning_once(
+                        "Detected %d prompt updates for `mm_items[%r][%s]`. "
+                        "Multiple prompt updates per item is now "
+                        "deprecated and may be removed in v0.13. "
+                        "Instead, please specify dynamic update targets "
+                        "in the same prompt update definition by passing "
+                        "a function to `PromptUpdate.target`.",
+                        len(prompt_updates),
+                        modality,
+                        item_idx,
+                    )
+
+        return mm_prompt_updates
+
     def _find_mm_placeholders(
         self,
-        mm_prompt_updates: Mapping[str, Sequence[BoundPromptUpdate]],
         new_token_ids: list[int],
-        mm_item_counts: Mapping[str, int],
+        mm_prompt_updates: MultiModalPromptUpdates,
     ) -> Mapping[str, list[PlaceholderFeaturesInfo]]:
-        return find_mm_placeholders(mm_prompt_updates, new_token_ids,
-                                    mm_item_counts)
+        tokenizer = self.info.get_tokenizer()
+
+        return find_mm_placeholders(new_token_ids, mm_prompt_updates,
+                                    tokenizer)
 
     def _get_hf_mm_data(
         self,
@@ -1611,9 +1670,8 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
 
         if is_update_applied:
             mm_placeholders = self._find_mm_placeholders(
-                mm_prompt_updates,
                 prompt_ids,
-                mm_item_counts,
+                mm_prompt_updates,
             )
             self._validate_mm_placeholders(mm_placeholders, mm_item_counts)
 
@@ -1627,7 +1685,6 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             ) = self._apply_prompt_updates(
                 prompt_ids,
                 mm_prompt_updates,
-                mm_item_counts,
             )
             self._validate_mm_placeholders(mm_placeholders, mm_item_counts)
 

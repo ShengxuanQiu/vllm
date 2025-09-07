@@ -18,7 +18,7 @@ docker run --privileged --net host --shm-size=16G -it \
     -e "HF_TOKEN=$HF_TOKEN" --name tpu-test \
     vllm-tpu /bin/bash -c "python3 -m pip install git+https://github.com/thuml/depyf.git \
     && python3 -m pip install pytest pytest-asyncio tpu-info \
-    && python3 -m pip install lm_eval[api]==0.4.4 \
+    && python3 -m pip install --progress-bar off "lm-eval @ git+https://github.com/EleutherAI/lm-evaluation-harness.git@206b7722158f58c35b7ffcd53b035fdbdda5126d" \
     && export VLLM_XLA_CACHE_PATH= \
     && export VLLM_USE_V1=1 \
     && export VLLM_XLA_CHECK_RECOMPILATION=1 \

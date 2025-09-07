@@ -716,8 +716,8 @@ class MiniMaxText01DecoderLayer(nn.Module):
         if self.expert_num == 1:
             hidden_states = self.mlp(layernorm_output)
         else:
-            moe_hidden_states = self.block_sparse_moe(
-                copy.deepcopy(layernorm_output))
+            moe_layernorm_output = layernorm_output.clone()
+            moe_hidden_states = self.block_sparse_moe(moe_layernorm_output)
             if self.shared_moe:
                 before_moe_dtype = layernorm_output.dtype
                 moe_hidden_fp32 = moe_hidden_states.to(torch.float32)
@@ -963,7 +963,6 @@ class MiniMaxText01ForCausalLM(nn.Module, HasInnerState, IsHybrid,
 
         super().__init__()
         config = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
         lora_config = vllm_config.lora_config
         self.config = config
         self.lora_config = lora_config

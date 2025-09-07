@@ -58,6 +58,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = ca_comm.custom_all_reduce(input_)
             assert out is not None
             return out
+        symm_mem_comm = self.symm_mem_comm
+        if symm_mem_comm is not None and \
+            symm_mem_comm.should_use_symm_mem(input_):
+            out = symm_mem_comm.all_reduce(input_)
+            assert out is not None
+            return out
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
         out = pynccl_comm.all_reduce(input_)
@@ -90,7 +96,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                              dtype=input_tensor.dtype,
                              device=input_tensor.device)
 
-        pynccl_comm.reduce_scatter(output, input_)
+        pynccl_comm.reduce_scatter(output, input_tensor)
 
         # Reshape before returning
         return output.movedim(0, dim).contiguous()

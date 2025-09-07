@@ -128,7 +128,7 @@ class Qwen2_5_VLVideoPixelInputs(TypedDict):
 
     second_per_grid_ts: torch.Tensor
     """
-    The video time interval (in seconds) for each grid along the temporal 
+    The video time interval (in seconds) for each grid along the temporal
     dimension in the 3D position IDs. Returned when `videos` is not `None`.
     """
 

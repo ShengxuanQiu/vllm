@@ -21,7 +21,7 @@ Main reference: DeepseekV2 paper, and FlashInfer Implementation
 (https://arxiv.org/abs/2405.04434 and https://github.com/flashinfer-ai/flashinfer/pull/551).
 
 Deepseek's MLA attention works the following way:
-* Use a single latent vector to represent the per-token entry of the KV cache. 
+* Use a single latent vector to represent the per-token entry of the KV cache.
 * For decode (i.e. the memory friendly approach) the attention "simulates" a
 multi-head attention, while the compute is similar to multi-query attention.
 
@@ -79,7 +79,7 @@ spda_o = scaled_dot_product_attention(
     torch.cat([q_nope, q_pe], dim=-1),
     torch.cat([k_nope, k_pe.unsqueeze(1).expand(-1, N, -1)], dim=-1),
     v
-) 
+)
 return spda_o @ W_O
 
 NOTE: in the actual code,
@@ -117,20 +117,20 @@ return o.view(-1, N * V) @ self.num_heads @ W_O
 
 ## Chunked Prefill
 
-For chunked prefill we want to use the compute friendly algorithm. We are 
-assuming sufficiently large Sq / Skv ratio, in the future may want to switch to 
+For chunked prefill we want to use the compute friendly algorithm. We are
+assuming sufficiently large Sq / Skv ratio, in the future may want to switch to
 the data-movement friendly approach if the chunk (i.e. `Sq`) is small.
 
 However, the compute-friendly approach can potentially run out of memory if Skv
 is large due to: `k_nope = (kv_c @ W_UK).view(Skv, N, P)`
 
-To mitigate this, we chunk the computation of attention with respect to the 
-current context (i.e. `cache_kv_c` and `cache_k_pe`) so that we can used a 
+To mitigate this, we chunk the computation of attention with respect to the
+current context (i.e. `cache_kv_c` and `cache_k_pe`) so that we can used a
 fixed workspace size.
 
 The chunked prefill approach is as follows:
 
-MCC        Max chunk of context to process per iter, computed dynamically, 
+MCC        Max chunk of context to process per iter, computed dynamically,
            used to bound the memory usage
 
 q_c        = h_t @ W_DQ
@@ -152,7 +152,7 @@ curr_o, curr_lse = scaled_dot_product_attention(
     new_v,
     casual=True,
     return_softmax_lse=True
-) 
+)
 
 // Compute attention with the already existing context
 for chunk_idx in range(cdiv(C, MCC)):
@@ -765,6 +765,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
+        k_scale: torch.Tensor,
     ):
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
@@ -777,12 +778,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
 
-            ops.gather_cache(
+            ops.gather_and_maybe_dequant_cache(
                 src_cache=kv_c_and_k_pe_cache,
                 dst=workspace,
                 block_table=prefill_metadata.block_table,
                 cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
                 batch_size=attn_metadata.num_prefills,
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=k_scale,
                 seq_starts=prefill_metadata.chunked_context.starts[i],
             )
 
@@ -839,6 +842,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         k_pe: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
+        k_scale: torch.Tensor,
     ) -> torch.Tensor:
         assert attn_metadata.prefill is not None
 
@@ -866,7 +870,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         if has_context:
             suffix_output, suffix_lse = output
             context_output, context_lse = self._compute_prefill_context( \
-                q, kv_c_and_k_pe_cache, attn_metadata)
+                q, kv_c_and_k_pe_cache, attn_metadata, k_scale)
 
             output = torch.empty_like(suffix_output)
             merge_attn_states(
@@ -886,6 +890,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         q_pe: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: M,
+        layer: AttentionLayer,
     ) -> torch.Tensor:
         raise NotImplementedError
 

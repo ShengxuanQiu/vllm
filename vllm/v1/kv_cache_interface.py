@@ -6,6 +6,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.utils import cdiv, get_dtype_size
 
 logger = init_logger(__name__)

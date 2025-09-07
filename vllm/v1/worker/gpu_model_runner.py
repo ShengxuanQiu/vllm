@@ -295,7 +295,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
-            self.encoder_cache.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -744,9 +743,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 src_start = num_computed_tokens
                 src_end = num_computed_tokens + prompt_part_len
 
-                self.mrope_positions_cpu[:, dst_start:dst_end] = \
-                    req.mrope_positions[:,src_start:src_end]
-
+                self.mrope_positions.cpu[:, dst_start:dst_end] = (
+                    req.mrope_positions[:, src_start:src_end])
                 mrope_pos_ptr += prompt_part_len
 
             if completion_part_len > 0:
@@ -828,7 +826,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        draft_token_ids = self.input_ids[logits_indices]
+        draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
         metadata = SpecDecodeMetadata(
@@ -890,15 +888,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for output in curr_group_outputs:
                 encoder_outputs.append(output)
 
-        # Cache the encoder outputs.
-        for (req_id, input_id, pos_info), output in zip(
-                req_ids_pos,
-                encoder_outputs,
-        ):
-            if req_id not in self.encoder_cache:
-                self.encoder_cache[req_id] = {}
-
-            self.encoder_cache[req_id][input_id] = scatter_mm_placeholders(
+        # Cache the encoder outputs by mm_hash
+        for (mm_hash, pos_info), output in zip(mm_hashes_pos, encoder_outputs):
+            self.encoder_cache[mm_hash] = scatter_mm_placeholders(
                 output,
                 is_embed=pos_info.is_embed,
             )
@@ -933,11 +925,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 start_idx = max(num_computed_tokens - start_pos, 0)
                 end_idx = min(
                     num_computed_tokens - start_pos + num_scheduled_tokens,
-                    num_encoder_tokens)
+                    num_encoder_tokens,
+                )
                 assert start_idx < end_idx
-                assert req_id in self.encoder_cache
-                assert i in self.encoder_cache[req_id]
-                encoder_output = self.encoder_cache[req_id][i]
+
+                mm_hash = mm_hashes[i]
+                encoder_output = self.encoder_cache.get(mm_hash, None)
+                assert encoder_output is not None,\
+                    f"Encoder cache miss for {mm_hash}."
 
                 if (is_embed := pos_info.is_embed) is not None:
                     is_embed = is_embed[start_idx:end_idx]
@@ -1180,7 +1175,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         max_gen_len = sampled_token_ids.shape[-1]
         if max_gen_len == 1:
             # No spec decode tokens.
-            valid_sampled_token_ids = sampled_token_ids.tolist()
+            valid_sampled_token_ids = self._to_list(sampled_token_ids)
         else:
             # Includes spec decode tokens.
             valid_sampled_token_ids = self.rejection_sampler.parse_output(
@@ -1408,7 +1403,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # If this is a partial request (i.e. chunked prefill),
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
-            offset = self.query_start_loc_np[req_idx].item()
+            offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset:offset + num_logits]
             logits = self.model.compute_logits(prompt_hidden_states, None)
 

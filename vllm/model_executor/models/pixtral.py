@@ -42,6 +42,7 @@ from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.tokenizer import (MistralTokenizer,
                                                cached_tokenizer_from_config)
+from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from .utils import (flatten_bn, init_vllm_registered_model, maybe_prefix,
@@ -335,10 +336,6 @@ class PixtralForConditionalGeneration(nn.Module, SupportsMultiModal,
         images = kwargs.pop("images", None)
         if images is None:
             return None
-
-        if not isinstance(images, (torch.Tensor, list)):
-            raise ValueError("Incorrect type of images. "
-                             f"Got type: {type(images)}")
 
         return PixtralImagePixelInputs(
             type="pixel_values",

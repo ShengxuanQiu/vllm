@@ -19,6 +19,17 @@ logger = init_logger(__name__)
 PADDING_SLOT_ID = -1
 
 
+class EagleAttentionMetadata(Protocol):
+    # Required attributes
+    num_actual_tokens: int
+    max_query_len: int
+    query_start_loc: torch.Tensor
+    max_seq_len: int
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    slot_mapping: torch.Tensor
+
+
 class EagleProposer:
 
     def __init__(

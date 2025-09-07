@@ -89,6 +89,7 @@ class OlmoAttention(nn.Module):
             self.total_num_heads,
             bias=config.attention_bias,
             quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
 
         # Rotary embeddings.
@@ -112,6 +113,7 @@ class OlmoAttention(nn.Module):
             self.hidden_size,
             bias=config.attention_bias,
             quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
         )
 
     def forward(
@@ -140,6 +142,7 @@ class OlmoMLP(nn.Module):
         self,
         config: OlmoConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.config = config
@@ -152,6 +155,7 @@ class OlmoMLP(nn.Module):
             [self.intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
         )
 
         # Activation function.
@@ -163,6 +167,7 @@ class OlmoMLP(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
         )
 
     def forward(
@@ -195,7 +200,7 @@ class OlmoDecoderLayer(nn.Module):
                                        prefix=f"{prefix}.self_attn")
 
         # MLP block.
-        self.mlp = OlmoMLP(config, quant_config)
+        self.mlp = OlmoMLP(config, quant_config, prefix=f"{prefix}.mlp")
 
         # LayerNorm
         self.input_layernorm = nn.LayerNorm(config.hidden_size,

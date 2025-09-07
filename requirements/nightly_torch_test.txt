@@ -25,4 +25,4 @@ tensorizer>=2.9.0
 lm-eval==0.4.8
 buildkite-test-collector==0.1.9
 
-lm-eval[api]==0.4.8 # required for model evaluation test
+lm-eval[api] @ git+https://github.com/EleutherAI/lm-evaluation-harness.git@206b7722158f58c35b7ffcd53b035fdbdda5126d # required for model evaluation test

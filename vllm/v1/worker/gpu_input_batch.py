@@ -48,8 +48,7 @@ class CachedRequestState:
     def get_token_id(self, idx: int) -> int:
         if idx < self.num_prompt_tokens:
             return self.prompt_token_ids[idx]
-        else:
-            return self.output_token_ids[idx - self.num_prompt_tokens]
+        return self.output_token_ids[idx - self.num_prompt_tokens]
 
 
 class InputBatch:
@@ -490,6 +489,21 @@ class InputBatch:
             self.num_computed_tokens_cpu[
                 empty_index] = self.num_computed_tokens_cpu[last_req_index]
             self.block_table.move_row(last_req_index, empty_index)
+
+            self.request_lora_mapping[empty_index] = self.request_lora_mapping[
+                last_req_index]
+
+            if self.is_pooling_model:
+                last_req_index -= 1
+                # Samping state not used by pooling models.
+                continue
+
+            # Autoregressive models require detailed tracking of condense
+            # operations to support logitsprocs
+            self.batch_update_builder.moved.append(
+                (last_req_index, empty_index,
+                 MoveDirectionality.UNIDIRECTIONAL))
+
             self.temperature_cpu[empty_index] = self.temperature_cpu[
                 last_req_index]
             self.top_p_cpu[empty_index] = self.top_p_cpu[last_req_index]
@@ -602,11 +616,10 @@ class InputBatch:
             pin_memory=self.pin_memory,
         )
         prompt_token_ids = prompt_token_ids_cpu_tensor.numpy()
-        prompt_token_ids[:] = self.token_ids_cpu[:self.
-                                                 num_reqs, :max_prompt_len]
+        prompt_token_ids[:] = self.token_ids_cpu[:num_reqs, :max_prompt_len]
         # Use the value of vocab_size as a pad since we don't have a
         # token_id of this value.
-        for i in range(self.num_reqs):
+        for i in range(num_reqs):
             prompt_token_ids[i, self.num_prompt_tokens[i]:] = self.vocab_size
         return prompt_token_ids_cpu_tensor.to(device=self.device,
                                               non_blocking=True)

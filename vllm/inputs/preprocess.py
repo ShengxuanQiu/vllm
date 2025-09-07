@@ -29,12 +29,14 @@ class InputPreprocessor:
         model_config: ModelConfig,
         tokenizer: Optional[TokenizerGroup],
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
+        mm_processor_cache: Optional[BaseMultiModalProcessorCache] = None,
     ) -> None:
         super().__init__()
 
         self.model_config = model_config
         self.tokenizer = tokenizer
         self.mm_registry = mm_registry
+        self.mm_processor_cache = mm_processor_cache
 
     def get_tokenizer_group(self) -> TokenizerGroup:
         if self.tokenizer is None:
@@ -291,7 +293,6 @@ class InputPreprocessor:
 
         * prompt: single encoder or decoder input prompt
         * lora_request: this is only valid for decoder prompts
-        * return_mm_hashes: whether to return multimodal hashes
 
         Returns:
 

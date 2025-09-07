@@ -337,8 +337,21 @@ class repackage_wheel(build_ext):
 
         wheel_location = os.getenv("VLLM_PRECOMPILED_WHEEL_LOCATION", None)
         if wheel_location is None:
-            base_commit = self.get_base_commit_in_main_branch()
-            wheel_location = f"https://wheels.vllm.ai/{base_commit}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
+            import platform
+            arch = platform.machine()
+            if arch == "x86_64":
+                wheel_tag = "manylinux1_x86_64"
+            elif arch == "aarch64":
+                wheel_tag = "manylinux2014_aarch64"
+        else:
+            raise ValueError(f"Unsupported architecture: {arch}")
+
+        base_commit = self.get_base_commit_in_main_branch()
+        wheel_location = f"https://wheels.vllm.ai/{base_commit}/vllm-1.0.0.dev-cp38-abi3-{wheel_tag}.whl"
+
+        nightly_wheel_url = f"https://wheels.vllm.ai/nightly/vllm-1.0.0.dev-cp38-abi3-{wheel_tag}.whl"
+        if not is_url_available(wheel_location):
+            wheel_location = nightly_wheel_url
             # Fallback to nightly wheel if latest commit wheel is unavailable,
             # in this rare case, the nightly release CI hasn't finished on main.
             if not is_url_available(wheel_location):

@@ -613,8 +613,12 @@ async def create_transcriptions(request: Annotated[TranscriptionRequest,
             message="The model does not support Transcriptions API")
 
     audio_data = await request.file.read()
-    generator = await handler.create_transcription(audio_data, request,
-                                                   raw_request)
+    try:
+        generator = await handler.create_transcription(audio_data, request,
+                                                       raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                            detail=str(e)) from e
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
@@ -1106,6 +1110,8 @@ async def run_server(args, **uvicorn_kwargs) -> None:
             ssl_certfile=args.ssl_certfile,
             ssl_ca_certs=args.ssl_ca_certs,
             ssl_cert_reqs=args.ssl_cert_reqs,
+            h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
+            h11_max_header_count=args.h11_max_header_count,
             **uvicorn_kwargs,
         )
 

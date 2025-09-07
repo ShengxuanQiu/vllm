@@ -86,7 +86,7 @@ class Sampler(nn.Module):
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Sample logits based on sampling metadata.
 
         The various logits processing functions called in this method
@@ -100,7 +100,13 @@ class Sampler(nn.Module):
         else:
             greedy_sampled = self.greedy_sample(logits)
             if sampling_metadata.all_greedy:
-                return greedy_sampled
+                processed_logprobs = None
+                if sampling_metadata.max_num_logprobs is not None:
+                    if self.logprobs_mode == LogprobsMode.PROCESSED_LOGITS:
+                        processed_logprobs = logits
+                    elif self.logprobs_mode == LogprobsMode.PROCESSED_LOGPROBS:
+                        processed_logprobs = self.compute_logprobs(logits)
+                return greedy_sampled, processed_logprobs
 
         assert sampling_metadata.temperature is not None
 
@@ -120,7 +126,7 @@ class Sampler(nn.Module):
         )
 
         if greedy_sampled is None:
-            return random_sampled
+            return random_sampled, processed_logprobs
 
         sampled = torch.where(
             sampling_metadata.temperature < _SAMPLING_EPS,
@@ -128,7 +134,7 @@ class Sampler(nn.Module):
             random_sampled,
             out=greedy_sampled,  # Reuse tensor
         )
-        return sampled
+        return sampled, processed_logprobs
 
     def compute_logprobs(self, logits: torch.Tensor) -> torch.Tensor:
         return logits.log_softmax(dim=-1, dtype=torch.float32)

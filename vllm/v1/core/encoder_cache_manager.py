@@ -72,10 +72,31 @@ def compute_encoder_budget(
     """Compute the encoder cache budget based on the model and scheduler 
     configurations.
 
+    Returns:
+        - Compute budget for encoder execution, measured in number of tokens
+            from the input sequence.
+        - Space budget for encoder cache size, measured in number of tokens
+            from the input sequence.
+    """
+    if mm_registry.supports_multimodal_inputs(model_config):
+        max_tokens_by_modality = mm_registry \
+            .get_max_tokens_per_item_by_nonzero_modality(model_config)
+
+        return compute_mm_encoder_budget(
+            scheduler_config,
+            max_tokens_by_modality,
+        )
+
+    return compute_text_encoder_budget(scheduler_config)
+
+
+def compute_text_encoder_budget(
+        scheduler_config: "SchedulerConfig") -> tuple[int, int]:
+    """Compute the encoder cache budget based on the model and scheduler
+    configurations for a text-only model.
+
     Args:
-        model_config: Model configuration.
         scheduler_config: Scheduler configuration.
-        mm_registry: Provides information about the token cost.
 
     Returns:
         - Compute budget for encoder execution, in unit of number of tokens 

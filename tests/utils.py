@@ -80,7 +80,8 @@ class RemoteOpenAIServer:
                  env_dict: Optional[dict[str, str]] = None,
                  seed: Optional[int] = 0,
                  auto_port: bool = True,
-                 max_wait_seconds: Optional[float] = None) -> None:
+                 max_wait_seconds: Optional[float] = None,
+                 override_hf_configs: Optional[dict[str, Any]] = None) -> None:
         if auto_port:
             if "-p" in vllm_serve_args or "--port" in vllm_serve_args:
                 raise ValueError("You have manually specified the port "
@@ -621,9 +622,12 @@ def multi_process_parallel(
     os.environ["RAY_RUNTIME_ENV_IGNORE_GITIGNORE"] = "1"
     ray.init(
         runtime_env={
-            "working_dir": VLLM_PATH,
-            "excludes":
-            ["build", ".git", "cmake-build-*", "shellcheck", "dist"]
+            "working_dir":
+            VLLM_PATH,
+            "excludes": [
+                "build", ".git", "cmake-build-*", "shellcheck", "dist",
+                "ep_kernels_workspace"
+            ]
         })
 
     distributed_init_port = get_open_port()

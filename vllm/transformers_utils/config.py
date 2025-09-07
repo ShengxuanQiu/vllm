@@ -300,6 +300,7 @@ def get_config(
             raise ValueError(error_message) from e
 
     if config_format == ConfigFormat.HF:
+        kwargs["local_files_only"] = huggingface_hub.constants.HF_HUB_OFFLINE
         config_dict, _ = PretrainedConfig.get_config_dict(
             model,
             revision=revision,
@@ -384,7 +385,7 @@ def try_get_local_file(model: Union[str, Path],
                                                      revision=revision)
             if isinstance(cached_filepath, str):
                 return Path(cached_filepath)
-        except HFValidationError:
+        except ValueError:
             ...
     return None
 

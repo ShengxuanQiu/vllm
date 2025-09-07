@@ -64,12 +64,11 @@ class TestModel(torch.nn.Module):
 @pytest.mark.parametrize("num_tokens", [7, 256, 533, 2048, 2049])
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
 @pytest.mark.parametrize("static", [True, False])
-@pytest.mark.parametrize("cutlass_fp8_enabled",
-                         [True, False] if CUTLASS_FP8_SUPPORTED else [False])
+@pytest.mark.parametrize("force_fp8_e4m3fnuz", [True, False])
 @pytest.mark.skipif(envs.VLLM_TARGET_DEVICE not in ["cuda", "rocm"],
                     reason="Only test on CUDA and ROCm")
 def test_fusion_rmsnorm_quant(dtype, hidden_size, num_tokens, eps, static,
-                              cutlass_fp8_enabled):
+                              force_fp8_e4m3fnuz):
     torch.set_default_device("cuda")
     torch.set_default_dtype(dtype)
     torch.manual_seed(1)
@@ -86,7 +85,7 @@ def test_fusion_rmsnorm_quant(dtype, hidden_size, num_tokens, eps, static,
         fusion_pass = FusionPass.instance(vllm_config)
 
         backend = TestBackend(noop_pass, fusion_pass)
-        model = TestModel(hidden_size, eps, static, cutlass_fp8_enabled)
+        model = TestModel(hidden_size, eps, static, force_fp8_e4m3fnuz)
 
         # First dimension dynamic
         x = torch.rand(num_tokens, hidden_size)

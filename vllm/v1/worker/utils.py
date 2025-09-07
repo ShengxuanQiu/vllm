@@ -43,10 +43,10 @@ def scatter_mm_placeholders(
 
     Args:
         embeds: The multimodal embeddings.
-          Shape: `(num_embeds, embed_dim)`
+            Shape: `(num_embeds, embed_dim)`
         is_embed: A boolean mask indicating which positions in the placeholder
-          tokens need to be filled with multimodal embeddings.
-          Shape: `(num_placeholders, num_embeds)`
+            tokens need to be filled with multimodal embeddings.
+            Shape: `(num_placeholders, num_embeds)`
     """
     if is_embed is None:
         return embeds

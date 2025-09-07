@@ -419,6 +419,14 @@ def validate_args(args):
         raise ValueError(
             "Tokenizer must be the same as the model for MII backend.")
 
+    # --data-parallel is not supported currently.
+    # https://github.com/vllm-project/vllm/issues/16222
+    if args.data_parallel_size > 1:
+        raise ValueError(
+            "Data parallel is not supported in offline benchmark, "
+            "please use benchmark serving instead"
+        )
+
 
 def add_cli_args(parser: argparse.ArgumentParser):
     parser.add_argument("--backend",

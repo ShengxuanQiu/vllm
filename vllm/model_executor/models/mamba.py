@@ -73,10 +73,12 @@ class MambaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        hidden_states = self.mixer(hidden_states, mamba_cache_params)
-        return hidden_states, residual
+        output = torch.empty_like(hidden_states)
+        self.mixer(hidden_states, output, mamba_cache_params)
+        return output, residual
 
 
+@support_torch_compile
 class MambaModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):

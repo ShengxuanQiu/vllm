@@ -13,8 +13,9 @@ from vllm.transformers_utils.tokenizer import (AnyTokenizer,
                                                cached_tokenizer_from_config)
 from vllm.utils import ClassRegistry
 
-from .processing import (BaseMultiModalProcessor, BaseProcessingInfo,
-                         ProcessingCache)
+from .cache import (BaseMultiModalProcessorCache,
+                    processor_only_cache_from_config)
+from .processing import BaseMultiModalProcessor, BaseProcessingInfo
 from .profiling import (BaseDummyInputsBuilder, DummyDecoderData,
                         DummyEncoderData, MultiModalProfiler)
 
@@ -55,7 +56,7 @@ class MultiModalProcessorFactory(Protocol[_I]):
         info: _I,
         dummy_inputs: BaseDummyInputsBuilder[_I],
         *,
-        cache: Optional[ProcessingCache] = None,
+        cache: Optional[BaseMultiModalProcessorCache] = None,
     ) -> BaseMultiModalProcessor[_I]:
         ...
 
@@ -98,9 +99,11 @@ class MultiModalRegistry:
     def get_max_tokens_per_item_by_modality(
         self,
         model_config: "ModelConfig",
+        *,
+        cache: Optional[BaseMultiModalProcessorCache] = None,
     ) -> Mapping[str, int]:
         """
-        Get the maximum number of tokens per data item from each modality based 
+        Get the maximum number of tokens per data item from each modality based
         on underlying model configuration.
         """
         if not model_config.is_multimodal_model:
@@ -123,6 +126,8 @@ class MultiModalRegistry:
     def get_max_tokens_per_item_by_nonzero_modality(
         self,
         model_config: "ModelConfig",
+        *,
+        cache: Optional[BaseMultiModalProcessorCache] = None,
     ) -> Mapping[str, int]:
         """
         Get the maximum number of tokens per data item from each modality based
@@ -130,18 +135,22 @@ class MultiModalRegistry:
         explicitly disabled via `limit_mm_per_prompt`.
 
         Note:
-            This is currently directly used only in V1 for profiling the memory 
+            This is currently directly used only in V1 for profiling the memory
             usage of a model.
         """
-        mm_limits = self.get_mm_limits_per_prompt(model_config)
+        mm_limits = self.get_mm_limits_per_prompt(model_config, cache=cache)
+        max_tokens_per_item = self.get_max_tokens_per_item_by_modality(
+            model_config,
+            cache=cache,
+        )
 
         return {
             key: max_tokens_per_mm_item
-            for key, max_tokens_per_mm_item in
-            self.get_max_tokens_per_item_by_modality(model_config).items()
+            for key, max_tokens_per_mm_item in max_tokens_per_item.items()
             if mm_limits[key] > 0
         }
 
+    # TODO: Remove once V0 is gone
     def get_max_tokens_by_modality(
         self,
         model_config: "ModelConfig",
@@ -182,6 +191,8 @@ class MultiModalRegistry:
     def get_mm_limits_per_prompt(
         self,
         model_config: "ModelConfig",
+        *,
+        cache: Optional[BaseMultiModalProcessorCache] = None,
     ) -> Mapping[str, int]:
         """
         Get the maximum number of multi-modal input instances for each modality
@@ -248,7 +259,7 @@ class MultiModalRegistry:
         model_config: "ModelConfig",
         *,
         tokenizer: Optional[AnyTokenizer] = None,
-        disable_cache: Optional[bool] = None,
+        cache: Optional[BaseMultiModalProcessorCache] = None,
     ) -> BaseMultiModalProcessor[BaseProcessingInfo]:
         """
         Create a multi-modal processor for a specific model and tokenizer.

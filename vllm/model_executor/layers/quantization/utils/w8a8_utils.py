@@ -167,8 +167,36 @@ def rocm_per_tensor_w8a8_scaled_mm(*, qinput: torch.Tensor,
                                   scale_a=scale_a,
                                   scale_b=scale_b,
                                   bias=bias)
+    return output
 
+
+def rocm_per_tensor_w8a8_scaled_mm_fake(
+        qinput: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype,
+        scale_a: torch.Tensor, scale_b: torch.Tensor, bias: torch.Tensor,
+        input_2d: torch.Tensor) -> torch.Tensor:
+    return qinput.new_empty((*qinput.shape[:-1], weight.shape[1]),
+                            dtype=out_dtype)
+
+
+def rocm_per_tensor_w8a8_scaled_mm(*, qinput: torch.Tensor,
+                                   weight: torch.Tensor,
+                                   out_dtype: torch.dtype,
+                                   scale_a: torch.Tensor,
+                                   scale_b: torch.Tensor, bias: torch.Tensor,
+                                   input_2d: torch.Tensor,
+                                   output_shape: list) -> torch.Tensor:
+    output = torch.ops.vllm.rocm_per_tensor_w8a8_scaled_mm_impl(
+        qinput, weight, out_dtype, scale_a, scale_b, bias, input_2d)
     return torch.narrow(output, 0, 0, input_2d.shape[0]).view(*output_shape)
+
+
+direct_register_custom_op(
+    op_name="rocm_per_tensor_w8a8_scaled_mm_impl",
+    op_func=rocm_per_tensor_w8a8_scaled_mm_impl,
+    mutates_args=[],
+    fake_impl=rocm_per_tensor_w8a8_scaled_mm_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
 
 
 def torch_per_tensor_w8a8_scaled_mm(*, qinput: torch.Tensor,
