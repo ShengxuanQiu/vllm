@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import Optional
+
 import torch
-import triton
-import triton.language as tl
 from einops import rearrange
+
+from vllm.triton_utils import tl, triton
 
 
 @triton.jit
@@ -538,7 +541,7 @@ def _linear_attn_decode_kernel(
     pid_d = tl.program_id(2)  # dimension block index
 
     # Load slot index for the current batch
-    slot_id = tl.load(slot_idx + pid_b)
+    slot_id = tl.load(slot_idx + pid_b).to(tl.int64)
 
     # Skip if slot_id is -1 (padding)
     if slot_id == -1:

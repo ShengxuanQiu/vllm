@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # Adapted from
 # https://huggingface.co/Qwen/Qwen-VL/blob/main/modeling_qwen.py
@@ -7,13 +8,12 @@
 
 import copy
 import math
-import re
 import unicodedata
-from collections.abc import Collection, Mapping, Sequence
-from collections.abc import Set as AbstractSet
+from collections.abc import Collection, Mapping, Sequence, Set
 from functools import lru_cache, partial
-from typing import Callable, List, Literal, Optional, TypedDict, Union
+from typing import Annotated, Callable, Literal, Optional, Union
 
+import regex as re
 import torch
 from torch import nn
 from torchvision import transforms
@@ -33,7 +33,7 @@ from vllm.model_executor.layers.resampler import Resampler2, get_abs_pos
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
-                                    MultiModalKwargs)
+                                    MultiModalKwargsItems)
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.multimodal.processing import (BaseMultiModalProcessor,
                                         BaseProcessingInfo, PromptReplacement,
@@ -55,7 +55,7 @@ class QwenImagePixelInputs(TensorSchema):
         - c: Number of channels (3)
         - h: Height
         - w: Width
-
+    
     Note that image_size is the value in the vision config to which we resize
     the image to in the normalization transform. Currently multi-image support
     can only be leveraged by passing image embeddings directly.
@@ -70,7 +70,7 @@ class QwenImageEmbeddingInputs(TensorSchema):
         - bn: Batch size * number of images
         - ifs: Image feature size (256)
         - hs: Hidden size
-
+    
     `hidden_size` must match the hidden size of the language model backbone
     and is stored in the visual config of the model if we have one.
     """
@@ -392,7 +392,8 @@ def _get_tokenizer_without_image_pad(
         tokenizer: PreTrainedTokenizer) -> PreTrainedTokenizer:
     """
     The logic of adding image pad tokens should only be applied in
-    :class:`QwenVLProcessor`, so they are patched out here.
+    [`QwenVLProcessor`][vllm.model_executor.models.qwen_vl.QwenVLProcessor],
+    so they are patched out here.
 
     The definition of the wrapped tokenizer can be found here:
     https://huggingface.co/Qwen/Qwen-VL/blob/main/tokenization_qwen.py
@@ -404,7 +405,7 @@ def _get_tokenizer_without_image_pad(
         def tokenize(
             self,
             text: str,
-            allowed_special: Union[AbstractSet[str], str] = "all",
+            allowed_special: Union[Set[str], str] = "all",
             disallowed_special: Union[Collection[str], str] = (),
             **kwargs,
         ) -> list[Union[bytes, str]]:
@@ -420,7 +421,7 @@ def _get_tokenizer_without_image_pad(
 
         def _decode(
             self,
-            token_ids: Union[int, List[int]],
+            token_ids: Union[int, list[int]],
             skip_special_tokens: bool = False,
             errors: Optional[str] = None,
             **kwargs,
@@ -588,6 +589,7 @@ class QwenVLMultiModalProcessor(BaseMultiModalProcessor[QwenVLProcessingInfo]):
         prompt: str,
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         # Drops anything between <img>/</img> tags; encoding with the tokenizer
         # will automatically add the image pads for the context.
@@ -608,6 +610,7 @@ class QwenVLMultiModalProcessor(BaseMultiModalProcessor[QwenVLProcessingInfo]):
             prompt=prompt,
             mm_data=mm_data,
             mm_kwargs=mm_kwargs,
+            tok_kwargs=tok_kwargs,
         )
 
     def _hf_processor_applies_updates(
@@ -615,6 +618,7 @@ class QwenVLMultiModalProcessor(BaseMultiModalProcessor[QwenVLProcessingInfo]):
         prompt_text: str,
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
     ) -> bool:
         return False
 
@@ -632,7 +636,7 @@ class QwenVLMultiModalProcessor(BaseMultiModalProcessor[QwenVLProcessingInfo]):
         self,
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
-        out_mm_kwargs: MultiModalKwargs,
+        out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
         tokenizer = self.info.get_tokenizer()
         special_tokens: dict[str,
@@ -679,6 +683,13 @@ class QwenVLForConditionalGeneration(QWenBaseModel, SupportsPP, SupportsLoRA,
             language_model="transformer.h",
             connector="transformer.visual.attn_pool",
             tower_model="transformer.visual.transformer")
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
+        if modality.startswith("image"):
+            return f"Picture {i}: <img></img>"
+
+        raise ValueError("Only image modality is supported")
 
     def __init__(
         self,
@@ -736,11 +747,11 @@ class QwenVLForConditionalGeneration(QWenBaseModel, SupportsPP, SupportsLoRA,
     def get_language_model(self) -> torch.nn.Module:
         return self.transformer
 
-    def get_multimodal_embeddings(
-            self, **kwargs: object) -> Optional[MultiModalEmbeddings]:
+    def get_multimodal_embeddings(self,
+                                  **kwargs: object) -> MultiModalEmbeddings:
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
-            return None
+            return []
 
         vision_embeddings = self._process_image_input(image_input)
         return vision_embeddings
@@ -752,7 +763,8 @@ class QwenVLForConditionalGeneration(QWenBaseModel, SupportsPP, SupportsLoRA,
     ) -> torch.Tensor:
         inputs_embeds = self.transformer.get_input_embeddings(input_ids)
 
-        if multimodal_embeddings is not None:
+        if multimodal_embeddings is not None \
+            and len(multimodal_embeddings) != 0:
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids, inputs_embeds, multimodal_embeddings,
                 self.transformer.visual.image_pad_id)

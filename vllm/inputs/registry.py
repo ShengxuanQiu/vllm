@@ -1,24 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Union
 
+import torch
 from transformers import BatchFeature, PretrainedConfig, ProcessorMixin
 from typing_extensions import TypeVar
 
+from vllm.logger import init_logger
 from vllm.transformers_utils.processor import cached_processor_from_config
-from vllm.transformers_utils.tokenizer import AnyTokenizer
-from vllm.utils import resolve_mm_processor_kwargs
+from vllm.utils import get_allowed_kwarg_only_overrides
+from vllm.utils.jsontree import JSONTree, json_map_leaves
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
     from vllm.multimodal import (MultiModalDataDict, MultiModalPlaceholderDict,
                                  MultiModalRegistry)
     from vllm.sequence import SequenceData
+    from vllm.transformers_utils.tokenizer import AnyTokenizer
+else:
+    ModelConfig = Any
+    MultiModalDataDict = Any
+    MultiModalPlaceholderDict = Any
+    MultiModalRegistry = Any
+    SequenceData = Any
+    AnyTokenizer = Any
 
 _T = TypeVar("_T")
 _C = TypeVar("_C", bound=PretrainedConfig, default=PretrainedConfig)
 _P = TypeVar("_P", bound=ProcessorMixin, default=ProcessorMixin)
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -28,7 +41,7 @@ class InputContext:
     modify the inputs.
     """
 
-    model_config: "ModelConfig"
+    model_config: ModelConfig
     """The configuration of the model."""
 
     def get_hf_config(
@@ -38,7 +51,7 @@ class InputContext:
     ) -> _C:
         """
         Get the HuggingFace configuration
-        (:class:`transformers.PretrainedConfig`) of the model,
+        (`transformers.PretrainedConfig`) of the model,
         additionally checking its type.
 
         Raises:
@@ -79,7 +92,7 @@ class InputContext:
     ) -> _P:
         """
         Get the HuggingFace processor
-        (:class:`transformers.ProcessorMixin`) of the model,
+        (`transformers.ProcessorMixin`) of the model,
         additionally checking its type.
 
         Raises:
@@ -101,7 +114,8 @@ class InputContext:
         Initialize a HuggingFace-like processor class, merging the
         keyword arguments with those in the model's configuration.
         """
-        base_kwargs = self.model_config.mm_processor_kwargs
+        mm_config = self.model_config.get_multimodal_config()
+        base_kwargs = mm_config.mm_processor_kwargs
         if base_kwargs is None:
             base_kwargs = {}
 
@@ -132,32 +146,51 @@ class InputProcessingContext(InputContext):
         hf_processor: ProcessorMixin,
         data: Mapping[str, object],
         kwargs: Mapping[str, object] = {},
-    ) -> BatchFeature:
+    ) -> Union[BatchFeature, JSONTree]:
         """
-        Call :code:`hf_processor` on the prompt :code:`data`
-        (text, image, audio...) with configurable options :code:`kwargs`.
+        Call `hf_processor` on the prompt `data`
+        (text, image, audio...) with configurable options `kwargs`.
         """
         assert callable(hf_processor)
 
-        base_kwargs = self.model_config.mm_processor_kwargs
-        if base_kwargs is None:
-            base_kwargs = {}
+        mm_config = self.model_config.get_multimodal_config()
+        merged_kwargs = mm_config.merge_mm_processor_kwargs(kwargs)
 
-        merged_kwargs = resolve_mm_processor_kwargs(
-            base_kwargs,
-            kwargs,
+        allowed_kwargs = get_allowed_kwarg_only_overrides(
             hf_processor,
+            merged_kwargs,
             requires_kw_only=False,
             allow_var_kwargs=True,
         )
 
+        def maybe_cast_dtype(x):
+            # This mimics the behavior of transformers.BatchFeature
+            if isinstance(x, torch.Tensor) and x.is_floating_point():
+                return x.to(dtype=self.model_config.dtype)
+            return x
+
         try:
-            return hf_processor(**data, **merged_kwargs, return_tensors="pt")
+            output = hf_processor(**data,
+                                  **allowed_kwargs,
+                                  return_tensors="pt")
+            # this emulates output.to(dtype=self.model_config.dtype)
+            if isinstance(output, BatchFeature):
+                cast_output = json_map_leaves(maybe_cast_dtype, output.data)
+                return BatchFeature(cast_output)
+
+            cast_output = json_map_leaves(maybe_cast_dtype, output)
+
+            logger.warning_once(
+                f"{type(hf_processor).__name__} did not return `BatchFeature`. "
+                "Make sure to match the behaviour of `ProcessorMixin` when "
+                "implementing custom processors.")
+            return cast_output
+
         except Exception as exc:
             msg = (f"Failed to apply {type(hf_processor).__name__} "
-                   f"on data={data} with kwargs={merged_kwargs}")
+                   f"on data={data} with kwargs={allowed_kwargs}")
 
-            raise RuntimeError(msg) from exc
+            raise ValueError(msg) from exc
 
 
 class DummyData(NamedTuple):
@@ -167,9 +200,9 @@ class DummyData(NamedTuple):
     Note: This is only used in V0.
     """
 
-    seq_data: "SequenceData"
-    multi_modal_data: Optional["MultiModalDataDict"] = None
-    multi_modal_placeholders: Optional["MultiModalPlaceholderDict"] = None
+    seq_data: SequenceData
+    multi_modal_data: Optional[MultiModalDataDict] = None
+    multi_modal_placeholders: Optional[MultiModalPlaceholderDict] = None
 
 
 class InputRegistry:
@@ -179,9 +212,9 @@ class InputRegistry:
 
     def dummy_data_for_profiling(
         self,
-        model_config: "ModelConfig",
+        model_config: ModelConfig,
         seq_len: int,
-        mm_registry: "MultiModalRegistry",
+        mm_registry: MultiModalRegistry,
         is_encoder_data: bool = False,
     ) -> DummyData:
         """
@@ -213,6 +246,6 @@ class InputRegistry:
 
         return DummyData(
             seq_data=SequenceData.from_seqs(dec_data.prompt_token_ids),
-            multi_modal_data=dec_data.multi_modal_data,
+            multi_modal_data=dec_data.multi_modal_data.get_data(),
             multi_modal_placeholders=dec_data.multi_modal_placeholders,
         )

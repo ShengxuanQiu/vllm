@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Optional
@@ -43,8 +45,26 @@ class LogprobsProcessor:
         tokenizer: Optional[AnyTokenizer],
         request: EngineCoreRequest,
     ) -> "LogprobsProcessor":
+        assert request.sampling_params is not None
         num_logprobs = request.sampling_params.logprobs
         num_prompt_logprobs = request.sampling_params.prompt_logprobs
+
+        conf_list: Optional[list[float]] = None
+        conf_group_list: Optional[deque[float]] = None
+
+        if hasattr(request.sampling_params, "extra_args") \
+            and request.sampling_params.extra_args is not None \
+            and request.sampling_params.extra_args.get("enable_conf", False):
+            conf_group_size = request.sampling_params.extra_args.get(
+                "window_size", 2048)
+            conf_threshold = request.sampling_params.extra_args.get(
+                "threshold", 17)
+            conf_group_list = deque(maxlen=conf_group_size)
+            conf_list = []
+        else:
+            conf_group_size = -1
+            conf_threshold = None
+
         return cls(
             tokenizer=tokenizer,
             cumulative_logprob=(None if num_logprobs is None else 0.),
@@ -176,7 +196,7 @@ class LogprobsProcessor:
 
     def pop_prompt_logprobs(self) -> Optional[PromptLogprobs]:
         """Pop and return all request prompt logprobs
-        
+
         The logprobs processor aggregates prompt chunk logprobs
         over one or more prefill chunks. This method returns
         all prompt logprobs at once and then forgets them.
@@ -214,7 +234,8 @@ class LogprobsProcessor:
         Returns:
           dict[token id, Logprob]
         """
-
+        if num_logprobs == -1:
+            num_logprobs = len(logprobs)
         # We do not need a special case for the sampled token
         # being in the topk, since inserting duplicated data
         # into a dictionary twice is the same as doing it once.

@@ -67,8 +67,6 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 
 
-
-
 @dataclass
 class SampleRequest:
     """
@@ -78,8 +76,11 @@ class SampleRequest:
     prompt: Union[str, list[str]]
     prompt_len: int
     expected_output_len: int
-    multi_modal_data: Optional[Union[MultiModalDataDict, dict]] = None
+    multi_modal_data: Optional[
+        Union[MultiModalDataDict, dict, list[dict]]
+    ] = None
     lora_request: Optional[LoRARequest] = None
+    request_id: Optional[str] = None
 
 
 # -----------------------------------------------------------------------------
@@ -89,6 +90,7 @@ class SampleRequest:
 
 class BenchmarkDataset(ABC):
     DEFAULT_SEED = 0
+    IS_MULTIMODAL = False
 
     def __init__(
         self,
@@ -130,10 +132,10 @@ class BenchmarkDataset(ABC):
             elif isinstance(mm_content, dict):
                 content.append(mm_content)
             else:
-                raise TypeError(
+                raise TypeError(  
                     "Could not process multimodal content of type: " +
-                    f"{type(mm_content)}"
-                )
+                    f"{type(mm_content)}"  
+                ) 
         return [{"role": "user", "content": content}]
 
     def load_data(self) -> None:
@@ -166,16 +168,17 @@ class BenchmarkDataset(ABC):
 
         Args:
             tokenizer (PreTrainedTokenizerBase): The base tokenizer to use if no
-            LoRA is selected.  max_loras (Optional[int]): The maximum number of
-            LoRAs available. If None, LoRA is not used.  lora_path
-            (Optional[str]): Path to the LoRA parameters on disk. If None, LoRA
-            is not used.
+                LoRA is selected.
+            max_loras (Optional[int]): The maximum number of LoRAs available.
+                If `None`, LoRA is not used.
+            lora_path (Optional[str]): Path to the LoRA parameters on disk.
+                If `None`, LoRA is not used.
 
         Returns:
-            tuple[Optional[LoRARequest], AnyTokenizer]: A tuple where the first
-            element is a LoRARequest (or None if not applicable) and the second
-            element is the tokenizer associated with the LoRA request (or the
-            base tokenizer).
+            A tuple with the following elements:
+                - A new [LoRARequest][] (or `None` if not applicable).
+                - The tokenizer associated with the LoRA request
+                  (or the base tokenizer).
         """
         if max_loras is None or lora_path is None:
             return None, tokenizer
@@ -195,7 +198,8 @@ class BenchmarkDataset(ABC):
 
     @abstractmethod
     def sample(self, tokenizer: PreTrainedTokenizerBase,
-               num_requests: int) -> list[SampleRequest]:
+               num_requests: int, 
+               request_id_prefix: str = "") -> list[SampleRequest]:
         """
         Abstract method to generate sample requests from the dataset.
 
@@ -204,8 +208,10 @@ class BenchmarkDataset(ABC):
 
         Args:
             tokenizer (PreTrainedTokenizerBase): The tokenizer to be used
-             for processing the dataset's text.
+                for processing the dataset's text.
             num_requests (int): The number of sample requests to generate.
+            request_id_prefix (str) The prefix of request_id.
+            
 
         Returns:
             list[SampleRequest]: A list of sample requests generated from the
@@ -213,20 +219,31 @@ class BenchmarkDataset(ABC):
         """
         raise NotImplementedError("sample must be implemented in subclasses.")
 
-    def maybe_oversample_requests(self, requests: list[SampleRequest],
-                                  num_requests: int) -> None:
+    def maybe_oversample_requests(
+        self,
+        requests: list[SampleRequest],
+        num_requests: int,
+        request_id_prefix: str = "",
+    ) -> None:
         """
         Oversamples the list of requests if its size is less than the desired
         number.
 
         Args:
             requests (List[SampleRequest]): The current list of sampled
-            requests.  num_requests (int): The target number of requests.
+                requests.
+            num_requests (int): The target number of requests.
+            request_id_prefix (str) The prefix of the request ids.
+
         """
         if len(requests) < num_requests:
             random.seed(self.random_seed)
-            additional = random.choices(requests,
-                                        k=num_requests - len(requests))
+            additional = deepcopy(
+                random.choices(requests, k=num_requests - len(requests))
+            )
+            for i in range(len(additional)):
+                req = additional[i]
+                req.request_id = request_id_prefix + str(len(requests) + i)
             requests.extend(additional)
             logger.info("Oversampled requests to reach %d total samples.",
                         num_requests)
@@ -296,7 +313,7 @@ def process_image(image: Any) -> Mapping[str, Any]:
     if isinstance(image, dict) and 'bytes' in image:
         image = Image.open(BytesIO(image['bytes']))
     if isinstance(image, Image.Image):
-        image = image.convert("RGB")
+        image = convert_image_mode(image, "RGB")
         with io.BytesIO() as image_data:
             image.save(image_data, format="JPEG")
             image_base64 = base64.b64encode(
@@ -317,9 +334,6 @@ def process_image(image: Any) -> Mapping[str, Any]:
                      " or str or dictionary with raw image bytes.")
 
 
-# -----------------------------------------------------------------------------
-# Random Dataset Implementation (Synthetic Data)
-# -----------------------------------------------------------------------------
 def process_video(video: Any) -> Mapping[str, Any]:
     """
     Process a single video input and return a multimedia content dictionary.
@@ -355,7 +369,24 @@ def process_video(video: Any) -> Mapping[str, Any]:
         f"Invalid video input {video}. Must be a string of local path/remote url, or a dictionary with raw video bytes in the form of `{{'bytes': raw_video_bytes}}`."  # noqa: E501
     )
 
+# -----------------------------------------------------------------------------
+# Random Dataset Implementation (Synthetic Data)
+# -----------------------------------------------------------------------------
+
+
 class RandomDataset(BenchmarkDataset):
+    """
+    Synthetic text-only dataset for serving/throughput benchmarks.
+
+    Strategy:
+    - Sample input/output token lengths per request from integer-uniform ranges
+      around configured means (controlled by range_ratio).
+    - Prepend a fixed random prefix of length prefix_len.
+    - Generate the remaining tokens as a reproducible sequence:
+      (offset + index + arange(input_len)) % vocab_size.
+    - Decode then re-encode/truncate to ensure prompt token counts match.
+    - Uses numpy.default_rng seeded with random_seed for reproducible sampling.
+    """
     # Default values copied from benchmark_serving.py for the random dataset.
     DEFAULT_PREFIX_LEN = 0
     DEFAULT_RANGE_RATIO = 0.0
@@ -364,6 +395,9 @@ class RandomDataset(BenchmarkDataset):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
+        # Use numpy's default_rng for deterministic sampling
+        # Do not use random.seed() or np.random.seed() elsewhere in this class.
+        # This ensures that the RNG is isolated from global RNG state.
         self._rng = np.random.default_rng(self.random_seed)
 
     def sample(
@@ -378,11 +412,15 @@ class RandomDataset(BenchmarkDataset):
         batchsize: int = 1,
         **kwargs,
     ) -> list[SampleRequest]:
+
         input_lens, output_lens, offsets = self.get_sampling_params(
             num_requests, range_ratio, input_len, output_len, tokenizer
         )
+
+        # Generate prefix once
         prefix_token_ids = self.get_prefix(tokenizer, prefix_len)
         vocab_size = tokenizer.vocab_size
+
         requests = []
         for i in range(num_requests):
             prompt, total_input_len = self.generate_token_sequence(
@@ -467,8 +505,9 @@ class RandomDataset(BenchmarkDataset):
                 "Invalid output sampling interval: "
                 f"low={output_low} > high={output_high}"
             )
+
         logger.info(
-             "Sampling input_len from [%s, %s] and output_len from [%s, %s]",
+            "Sampling input_len from [%s, %s] and output_len from [%s, %s]",
             input_low,
             input_high,
             output_low,
@@ -480,8 +519,7 @@ class RandomDataset(BenchmarkDataset):
         output_lens = self._rng.integers(output_low, output_high + 1,
                                             size=num_requests)
         offsets = self._rng.integers(0, tokenizer.vocab_size, 
-                                         size=num_requests)
-
+                                        size=num_requests)
         return input_lens, output_lens, offsets
 
     def generate_token_sequence(
@@ -502,7 +540,8 @@ class RandomDataset(BenchmarkDataset):
         This is done because in some cases N consecutive tokens
         give a string tokenized into != N number of tokens.
         For example for GPT2Tokenizer:
-        [6880, 6881] -> ['Ġcalls', 'here'] ->        [1650, 939, 486] -> ['Ġcall', 'sh', 'ere']
+        [6880, 6881] -> ['Ġcalls', 'here'] ->
+        [1650, 939, 486] -> ['Ġcall', 'sh', 'ere']
         To avoid uncontrolled change of the prompt length,
         the encoded sequence is truncated before being decode again.
         """
@@ -522,6 +561,11 @@ class RandomDataset(BenchmarkDataset):
 
         return prompt, total_input_len
 
+
+# -----------------------------------------------------------------------------
+# MultiModalDataset Implementation
+# -----------------------------------------------------------------------------
+
 class RandomMultiModalDataset(RandomDataset):
     """
     Synthetic multimodal dataset (text + images) that extends RandomDataset.
@@ -539,10 +583,12 @@ class RandomMultiModalDataset(RandomDataset):
     2) Each item’s modality and shape is sampled from `bucket_config`, a dict
        mapping (height, width, num_frames) → probability. We treat 
        `num_frames`=1 as image and and `num_frames` > 1 as video. 
-       Entries with zero probability are removed and the rest are renormalized        to sum to 1.
+       Entries with zero probability are removed and the rest are renormalized 
+       to sum to 1.
     3) Per-modality hard caps are enforced via `limit_mm_per_prompt`.
        When a modality reaches its cap, all of its buckets are excluded and the
        remaining probabilities are renormalized.
+
     Example bucket configuration:
     {(256, 256, 1): 0.5, (720, 1280, 1): 0.4, (720, 1280, 16): 0.1}
       - Two image buckets (`num_frames`=1) and one video bucket 
@@ -550,23 +596,24 @@ class RandomMultiModalDataset(RandomDataset):
     OBS.: Only image sampling is supported for now.
     """
 
-    IS_MULTIMODAL = True    # NOTE: video sampling is WIP. Setting it to 0.
+    IS_MULTIMODAL = True
+    # NOTE: video sampling is WIP. Setting it to 0.
     DEFAULT_LIMIT_MM_PER_PROMPT = {"image": 255, "video": 0}
 
-    DEFAULT_BASE_ITEMS_PER_REQUEST = 1    
+    DEFAULT_BASE_ITEMS_PER_REQUEST = 1
     DEFAULT_NUM_MM_ITEMS_RANGE_RATIO = 0.0
     DEFAULT_MM_ITEM_BUCKET_CONFIG = {
         (256, 256, 1): 0.5,
         (720, 1280, 1): 0.5,
         (720, 1280, 16): 0.0,
-        }
+    }
     DEFAULT_ENABLE_MULTIMODAL_CHAT = False
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
 
 
-    def generate_synthetic_image(self, width: int, height: int) -> Image.Image:       
+    def generate_synthetic_image(self, width: int, height: int) -> Image.Image:
         """Generate synthetic PIL image with random RGB values.
         
         NOTE: iid pixel sampling results in worst-case compression 
@@ -597,7 +644,8 @@ class RandomMultiModalDataset(RandomDataset):
             return "image"
         elif config[-1] > 1:
             return "video"
-        else:            raise ValueError(f"Invalid multimodal item configuration: {config}")
+        else:
+            raise ValueError(f"Invalid multimodal item configuration: {config}")
 
     def normalize_bucket_config(self, bucket_config: dict[tuple[int, int, int], 
                                 float]) -> dict[tuple[int, int, int], float]:
@@ -621,17 +669,18 @@ class RandomMultiModalDataset(RandomDataset):
 
     def generate_mm_item(self, 
                          mm_item_config: tuple[int, int, int],
-                         ) -> Mapping[str, Any]:        
+                         ) -> Mapping[str, Any]:
         """
         Create synthetic images and videos and 
-        apply process_image/process_video respectively.        This follows the OpenAI API chat completions
+        apply process_image/process_video respectively.
+        This follows the OpenAI API chat completions
         https://github.com/openai/openai-python
         """
         
         if self.map_config_to_modality(mm_item_config) == "image":
             return process_image(self.generate_synthetic_image(
                                                             mm_item_config[1],
-                                                            mm_item_config[0]))        
+                                                            mm_item_config[0]))
         elif self.map_config_to_modality(mm_item_config) == "video":
             return process_video(self.generate_synthetic_video(
                                                             mm_item_config[1], 
@@ -641,8 +690,9 @@ class RandomMultiModalDataset(RandomDataset):
             raise ValueError(f"Invalid multimodal item configuration: "
                              f"{mm_item_config}")
 
+
     def get_mm_item_sampling_params(
-         self,
+        self,
         base_items_per_request: int,
         num_mm_items_range_ratio: float,
         limit_mm_per_prompt: dict[str, int],
@@ -760,7 +810,7 @@ class RandomMultiModalDataset(RandomDataset):
                 )
             else:
                 # If the counter is greater than the limit per prompt
-                # set all multimodal items of this modality to 0                
+                # set all multimodal items of this modality to 0
                 for k, v in bucket_config_copy.items():
                     if self.map_config_to_modality(k) == modality:
                         bucket_config_copy[k] = 0
@@ -825,7 +875,6 @@ class RandomMultiModalDataset(RandomDataset):
         # Add synthetic multimodal items to each request
         mm_requests = []
         for i in range(num_requests):
-
             prompt, total_input_len = self.generate_token_sequence(
                 tokenizer=tokenizer,
                 prefix_token_ids=prefix_token_ids,
@@ -863,15 +912,18 @@ class RandomMultiModalDataset(RandomDataset):
                 )
             else:
                 sample_request = SampleRequest(
-                     prompt=prompt,
-                     prompt_len=total_input_len,
-                     expected_output_len=int(output_lens[i]),
+                    prompt=prompt,
+                    prompt_len=total_input_len,
+                    expected_output_len=int(output_lens[i]),
                     multi_modal_data=mm_content,
-                     request_id=request_id_prefix + str(i),
-
+                    request_id=request_id_prefix + str(i),
                 )
             mm_requests.append(sample_request)
-        return mm_requests       
+        return mm_requests
+
+# -----------------------------------------------------------------------------
+# ShareGPT Dataset Implementation
+# -----------------------------------------------------------------------------
 
 
 class ShareGPTDataset(BenchmarkDataset):

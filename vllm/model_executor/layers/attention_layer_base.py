@@ -10,10 +10,10 @@ if TYPE_CHECKING:
 
 class AttentionLayerBase(ABC):
     """
-    Base class for attention-like layers (Attention, Mamba, etc.)
+    Base class for attention-like layers (Attention, Mamba, etc.) 
     that support the v1 engine.
-
-    This provides a common interface for getting attention backends
+    
+    This provides a common interface for getting attention backends 
     from different layer types.
     """
 

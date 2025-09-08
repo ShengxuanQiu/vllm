@@ -5,7 +5,7 @@ import functools
 import json
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+from typing import Sequence
 import torch
 import triton
 import triton.language as tl
@@ -521,3 +521,97 @@ def w8a8_block_fp8_matmul(
     )
 
     return C
+def get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
+    """
+    Returns TMA-aligned transposed format of the input tensor. `torch.transpose`
+        will be called if necessary.
+    If the input tensor is already column-major layout and 16-byte aligned along
+        the M axis (thus meets the requirement of LHS scaling tensor in
+        DeepGEMM), this function will do nothing.
+
+    Arguments:
+        x: usually the LHS scaling tensor in GEMM.
+
+    Returns:
+        The LHS scaling tensor of TMA-aligned transposed format.
+    """
+    # NOTES: for the extreme performance, you may rewrite/fuse this function in
+    # CUDA
+    assert x.dim() in (2, 3)
+    remove_dim = False
+    m, n = x.shape[-2], x.shape[-1]
+    aligned_m = get_tma_aligned_size(m, x.element_size())
+    if x.dim() == 2:
+        if x.stride(0) == 1 and x.stride(1) == aligned_m:
+            return x
+        x, remove_dim = x.unsqueeze(0), True
+
+    b = x.shape[0]
+
+    # The last kernel gives a column-major TMA aligned layout
+    if x.stride(0) == aligned_m * n and x.stride(1) == 1 and x.stride(
+            2) == aligned_m:
+        return x.squeeze(0) if remove_dim else x
+
+    # Normal layout requires transposing
+    aligned_x = torch.transpose(
+        torch.empty((b, n, aligned_m), device=x.device, dtype=x.dtype), 1, 2)
+    aligned_x[:, :m, :] = x
+    aligned_x = aligned_x[:, :m, :]
+    return aligned_x.squeeze(0) if remove_dim else aligned_x
+def requant_weight_ue8m0_inplace(
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        block_size: Sequence[int] = (128, 128),
+) -> None:
+    """Re-quantise *weight* so that its per-block scaling factors are in the
+    UE8M0 (power-of-two) format expected by the new DeepGEMM kernels inplace.
+
+    Args:
+        weight: Block-quantised weight tensor stored in ``torch.float8_e4m3fn``.
+            Expected shape ``(..., M, K)``.
+        weight_scale: Corresponding per-block scale tensor (``torch.float32``)
+            with shape ``(..., M // block_size[0], K // block_size[1])``.
+        block_size: 2-element iterable ``[block_m, block_k]`` describing the
+            block quantisation granularity.
+    """
+    if weight.numel() == 0:
+        return
+
+    if weight.dtype != torch.float8_e4m3fn:
+        raise ValueError("Expected *weight* to be torch.float8_e4m3fn, got "
+                         f"{weight.dtype} instead.")
+
+    from vllm.utils.deep_gemm import per_block_cast_to_fp8
+
+    block_m, block_k = int(block_size[0]), int(block_size[1])
+
+    # Flatten leading dimensions so we can iterate over the last two dims.
+    leading_shape = weight.shape[:-2]
+    if len(leading_shape) == 0:
+        w_view = weight.unsqueeze(0)
+        s_view = weight_scale.unsqueeze(0)
+    else:
+        w_view = weight.reshape(-1, weight.shape[-2], weight.shape[-1])
+        s_view = weight_scale.reshape(-1, *weight_scale.shape[-2:])
+
+    num_mats = w_view.size(0)
+    for idx in range(num_mats):
+        w_q = w_view[idx]
+        s_old = s_view[idx]
+
+        # De-quantise with the *old* scaling factors (float32).
+        m_cur, k_cur = w_q.shape
+        s_float = s_old.to(torch.float32)
+        # Expand scales along rows and cols by block size, then crop.
+        s_exp_r = torch.repeat_interleave(s_float, block_m, dim=0)
+        s_exp = torch.repeat_interleave(s_exp_r, block_k, dim=1)
+        s_exp = s_exp[:m_cur, :k_cur]
+        w_dq = w_q.to(torch.float32) * s_exp
+        # Re-quantise using power-of-two scaling (UE8M0).
+        w_requant, s_requant = per_block_cast_to_fp8(w_dq, [block_m, block_k],
+                                                     use_ue8m0=True)
+
+        # Write back the results in-place.
+        w_q.copy_(w_requant)
+        s_old.copy_(s_requant)

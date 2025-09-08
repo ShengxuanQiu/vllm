@@ -18,7 +18,7 @@ _PETIT_INSTALL_MSG = ("Petit is not installed. Please install it with "
 def _import_petit_kernel() -> "ModuleType":
     """
     A helper function to handle the lazy import.
-    The first time this function is called, it will import the petit_kernel
+    The first time this function is called, it will import the petit_kernel 
     library and store it in the global _petit_kernel variable.
     Subsequent calls will return the already-loaded module directly.
     """

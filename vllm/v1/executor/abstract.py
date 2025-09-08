@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from concurrent.futures import Future
-from typing import Callable, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -12,8 +13,9 @@ from vllm.executor.uniproc_executor import (  # noqa
     ExecutorWithExternalLauncher as ExecutorWithExternalLauncherV0)
 from vllm.executor.uniproc_executor import (  # noqa
     UniProcExecutor as UniProcExecutorV0)
+from vllm.utils import resolve_obj_by_qualname
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 FailureCallback = Callable[[], None]
 
@@ -92,6 +94,10 @@ class Executor(ExecutorBase):
     ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
         output = self.collective_rpc("execute_model",
                                      args=(scheduler_output, ))
+        return output[0]
+
+    def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
+        output = self.collective_rpc("take_draft_token_ids")
         return output[0]
 
     @property

@@ -208,7 +208,7 @@ def get_layer_partition_names(
     """
     Get all partition names associated with this layer.
     Names are returned in order of their partition indices.
-
+    
     ```python
     mapping = {"gate_up_proj", "gate_proj", "up_proj"}
 

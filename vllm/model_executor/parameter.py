@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Hashable
 from fractions import Fraction
 from typing import Callable, Optional, Union
+from weakref import WeakValueDictionary
 
 import torch
 from torch.nn import Parameter
 
-from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size)
 from vllm.logger import init_logger
 from vllm.model_executor.utils import _make_synced_weight_loader
 

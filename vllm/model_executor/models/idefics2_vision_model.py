@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # adapted from https://github.com/huggingface/transformers/blob/v4.43.2/src/transformers/models/idefics2/modeling_idefics2.py
 # Copyright 2024 The vLLM team.
@@ -17,7 +18,8 @@
 # limitations under the License.
 """PyTorch Idefics2 model."""
 
-from typing import Iterable, Optional, Set, Tuple
+from collections.abc import Iterable
+from typing import Optional
 
 import torch
 from torch import nn
@@ -376,12 +378,40 @@ class Idefics2VisionTransformer(nn.Module):
             patch_attention_mask=patch_attention_mask,
             tgt_sizes=tgt_sizes,
         )
-        encoder_outputs = self.encoder(hidden_states)
+        if self.use_data_parallel:
+            encoder_outputs = run_dp_sharded_vision_model(
+                hidden_states, self.encoder)
+        else:
+            encoder_outputs = self.encoder(hidden_states)
         last_hidden_state = self.post_layernorm(encoder_outputs)
         return last_hidden_state
 
-    def load_weights(self, weights: Iterable[Tuple[str,
-                                                   torch.Tensor]]) -> Set[str]:
+    def _consolidate_qkv_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        qkv_idx_mappings = {
+            ".self_attn.q_proj": 0,
+            ".self_attn.k_proj": 1,
+            ".self_attn.v_proj": 2,
+        }
+        qkv_weights = {}
+        for name, loaded_weight in weights:
+            for weight_name, idx in qkv_idx_mappings.items():
+                if weight_name not in name:
+                    continue
+                new_name = name.replace(weight_name, ".self_attn.qkv_proj")
+                if new_name not in qkv_weights:
+                    qkv_weights[new_name] = [None] * 3
+                qkv_weights[new_name][idx] = loaded_weight
+                break
+            else:
+                yield name, loaded_weight
+        for key, weight in qkv_weights.items():
+            qkv_weight = torch.cat(weight, dim=0)
+            yield key, qkv_weight
+
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -389,8 +419,11 @@ class Idefics2VisionTransformer(nn.Module):
             ("qkv_proj", "v_proj", "v"),
         ]
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
+        loaded_params: set[str] = set()
         layer_count = len(self.encoder.layers)
+
+        if self.use_data_parallel:
+            weights = self._consolidate_qkv_weights(weights)
 
         for name, loaded_weight in weights:
             # skip pooling header

@@ -266,13 +266,25 @@ def batched_rotary_embedding(positions: torch.Tensor, query: torch.Tensor,
                                           cos_sin_cache, is_neox, rot_dim,
                                           cos_sin_cache_offsets)
 
-
+def _has_c_op(op_name: str) -> bool:
+    try:
+        return hasattr(torch.ops, "_C") and hasattr(torch.ops._C, op_name)
+    except Exception:
+        return False
 # layer norm ops
-def rms_norm(out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
+def rms_norm(out: torch.Tensor,
+             input_contiguous: torch.Tensor,
+             weight: torch.Tensor,
              epsilon: float) -> None:
-    # TODO: Remove this contiguous call when the kernel is updated to support non-contiguous input
-    input_contiguous = input.contiguous()
-    torch.ops._C.rms_norm(out, input_contiguous, weight, epsilon)
+    # 优先调用已编译的自定义算子
+    if _has_c_op("rms_norm"):
+        return torch.ops._C.rms_norm(out, input_contiguous, weight, epsilon)
+
+    # PyTorch 回退实现（数值稳定，最后一维求均值）
+    x = input_contiguous
+    var = x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+    inv_rms = torch.rsqrt(var + float(epsilon)).to(dtype=x.dtype)
+    out.copy_(x * inv_rms * weight)  # 利用广播匹配最后一维
 
 
 def fused_add_rms_norm(input: torch.Tensor, residual: torch.Tensor,
