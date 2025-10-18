@@ -3187,6 +3187,28 @@ class DecodingConfig:
                              f" must be one of {valid_guided_backends}")
 
 
+@dataclass
+class RoeRuntimeHint:
+    """Runtime override for Roster of Experts (RoE) inference."""
+
+    enable: bool
+    """Whether RoE should be enabled for the upcoming decode step."""
+    effective_num_samples: int
+    """Number of routing samples to materialize when RoE is active."""
+    effective_tau: float
+    """Temperature applied to the Gumbel noise when RoE is active."""
+
+    def __post_init__(self) -> None:
+        if self.effective_num_samples < 1:
+            self.effective_num_samples = 1
+        if self.effective_tau < 0.0:
+            self.effective_tau = 0.0
+
+    @property
+    def is_active(self) -> bool:
+        return self.enable and self.effective_num_samples > 1
+
+
 @config
 @dataclass
 class RoeConfig:
@@ -3211,8 +3233,12 @@ class RoeConfig:
     """Runtime counter used to assign sequential indices to MoE layers."""
     _total_layers: int = field(init=False, default=0, repr=False)
     """Total number of MoE layers registered during model initialisation."""
-    _layer_prefix_to_index: dict[str, int] = field(init=False, default_factory=dict, repr=False)
+    _layer_prefix_to_index: dict[str, int] = field(
+        init=False, default_factory=dict, repr=False)
     """Maps layer identifier strings to their sequential RoE indices."""
+    _runtime_hint: Optional[RoeRuntimeHint] = field(
+        init=False, default=None, repr=False)
+    """Optional runtime override applied on top of the static configuration."""
 
     def compute_hash(self) -> str:
         factors: list[Any] = [
@@ -3243,6 +3269,7 @@ class RoeConfig:
         self._layer_counter = 0
         self._total_layers = 0
         self._layer_prefix_to_index.clear()
+        self._runtime_hint = None
 
     def register_layer(self, prefix: str) -> int:
         idx = self._layer_counter
@@ -3262,6 +3289,11 @@ class RoeConfig:
         return self._total_layers
 
     def tau_for_layer(self, layer_idx: int) -> float:
+        runtime_hint = self._runtime_hint
+        if runtime_hint is not None:
+            if not runtime_hint.enable:
+                return 0.0
+            return runtime_hint.effective_tau
         if not self.enabled:
             return 0.0
         if layer_idx < self.skip_front:
@@ -3272,6 +3304,39 @@ class RoeConfig:
         effective_idx = max(0, layer_idx - self.skip_front)
         schedule_idx = min(effective_idx, len(self.taus) - 1)
         return self.taus[schedule_idx]
+
+    def set_runtime_hint(self, hint: Optional[RoeRuntimeHint]) -> None:
+        """Set or clear the runtime override used during decoding."""
+        self._runtime_hint = hint
+
+    def get_runtime_hint(self) -> Optional[RoeRuntimeHint]:
+        """Return the currently active runtime override, if any."""
+        return self._runtime_hint
+
+
+    def build_runtime_hint(
+        self,
+        enable: Optional[bool],
+        num_samples: Optional[int] = None,
+        tau: Optional[float] = None,
+    ) -> Optional[RoeRuntimeHint]:
+        """Create a RoeRuntimeHint from the provided overrides."""
+        if enable is None:
+            return None
+
+        samples = num_samples if num_samples is not None else self.num_samples
+        if samples is None or samples < 1:
+            samples = 1
+
+        tau_value = tau if tau is not None else (self.taus[0] if self.taus else 0.0)
+
+        if not enable:
+            samples = 1
+            tau_value = 0.0
+
+        return RoeRuntimeHint(enable=bool(enable),
+                              effective_num_samples=int(samples),
+                              effective_tau=float(tau_value))
 
 
 @dataclass

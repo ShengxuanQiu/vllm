@@ -10,6 +10,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
+from threading import Lock
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Deque, Dict,
                     Iterable, List, Literal, Mapping, NamedTuple, Optional)
 from typing import Sequence as GenericSequence
@@ -21,7 +22,7 @@ from typing_extensions import TypeVar, deprecated
 import vllm.envs as envs
 from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
                          ObservabilityConfig, ParallelConfig, SchedulerConfig,
-                         VllmConfig)
+                         VllmConfig, RoeRuntimeHint)
 from vllm.core.scheduler import ScheduledSequenceGroup, SchedulerOutputs
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.metrics_types import StatLoggerBase, Stats
@@ -263,6 +264,8 @@ class LLMEngine:
 
         self.log_stats = log_stats
         self.use_cached_outputs = use_cached_outputs
+        self._runtime_roe_hint_lock = Lock()
+        self._runtime_roe_hint: Optional[RoeRuntimeHint] = None
 
         self.token_conf_logger = TokenConfidenceLogger(
             Path('logs/token_confidence.jsonl'))
@@ -1963,6 +1966,34 @@ class LLMEngine:
             max_lora=str(max_lora_stat),
             waiting_lora_adapters=list(waiting_lora_adapters.keys()),
             running_lora_adapters=list(running_lora_adapters.keys()))
+
+    def set_runtime_roe_hint(self, enable: Optional[bool],
+                               K: Optional[int] = None,
+                               tau: Optional[float] = None) -> None:
+        """Override RoE behaviour for subsequent decode steps.
+
+        Passing ``enable=None`` clears any runtime override and restores the
+        static configuration provided at engine startup.
+
+        Args:
+            enable: ``True`` to enable RoE, ``False`` to force-disable,
+                ``None`` to clear overrides.
+            K: Number of samples to replicate when enabled. Ignored when
+                ``enable`` is ``False`` or ``None``.
+            tau: Temperature to apply when enabled. Ignored when ``enable``
+                is ``False`` or ``None``.
+        """
+        roe_config = getattr(self.vllm_config, "roe_config", None)
+        if roe_config is None:
+            logger.debug("set_runtime_roe_hint ignored: RoeConfig unavailable.")
+            return
+
+        hint = roe_config.build_runtime_hint(enable, K, tau)
+
+        with self._runtime_roe_hint_lock:
+            self._runtime_roe_hint = hint
+        roe_config.set_runtime_hint(hint)
+        self.model_executor.collective_rpc("set_runtime_roe_hint", args=(hint, ))
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_executor.add_lora(lora_request)

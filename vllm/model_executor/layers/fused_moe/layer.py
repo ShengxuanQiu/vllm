@@ -451,7 +451,7 @@ class FusedMoE(torch.nn.Module):
                   and self.tp_size * self.dp_size > 1)
 
         self.roe_config = getattr(vllm_config, "roe_config", None)
-        if self.roe_config and self.roe_config.enabled:
+        if self.roe_config:
             layer_key = prefix if prefix else f"moe_{self.roe_config.total_layers}"
             self.roe_layer_idx = self.roe_config.register_layer(layer_key)
         else:

@@ -10,7 +10,7 @@ import cloudpickle
 import torch
 import torch.nn as nn
 
-from vllm.config import (ObservabilityConfig, VllmConfig,
+from vllm.config import (ObservabilityConfig, VllmConfig, RoeRuntimeHint,
                          set_current_vllm_config)
 from vllm.distributed import broadcast_tensor_dict, get_pp_group, get_tp_group
 from vllm.logger import init_logger
@@ -123,6 +123,12 @@ class WorkerBase:
 
     def list_loras(self) -> Set[int]:
         raise NotImplementedError
+
+    def set_runtime_roe_hint(self, hint: Optional[RoeRuntimeHint]) -> None:
+        runner = getattr(self, "model_runner", None)
+        if runner is not None and hasattr(runner, "set_runtime_roe_hint"):
+            runner.set_runtime_roe_hint(hint)
+
 
     @property
     def vocab_size(self) -> int:

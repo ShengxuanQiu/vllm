@@ -43,6 +43,7 @@ class CompletionOutput:
     finish_reason: Optional[str] = None
     stop_reason: Union[int, str, None] = None
     lora_request: Optional[LoRARequest] = None
+    confidence_values: Optional[list[float]] = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -54,7 +55,8 @@ class CompletionOutput:
                 f"cumulative_logprob={self.cumulative_logprob}, "
                 f"logprobs={self.logprobs}, "
                 f"finish_reason={self.finish_reason}, "
-                f"stop_reason={self.stop_reason})")
+                f"stop_reason={self.stop_reason}, "
+                f"confidence_values={self.confidence_values})")
 
 
 @dataclass

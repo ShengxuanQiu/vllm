@@ -7,7 +7,7 @@ from typing import Optional, Union
 import numpy as np
 
 import vllm.envs as envs
-from vllm.config import ModelConfig, VllmConfig
+from vllm.config import ModelConfig, VllmConfig, RoeRuntimeHint
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
 from vllm.envs import VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
@@ -84,6 +84,15 @@ class AsyncLLM(EngineClient):
         self.vllm_config = vllm_config
         self.log_requests = log_requests
         self.log_stats = log_stats
+
+        roe_config = getattr(self.vllm_config, "roe_config", None)
+        runtime_hint: Optional[RoeRuntimeHint]
+        if roe_config is not None:
+            runtime_hint = roe_config.get_runtime_hint()
+        else:
+            runtime_hint = None
+        self._runtime_roe_lock = asyncio.Lock()
+        self._runtime_roe_hint: Optional[RoeRuntimeHint] = runtime_hint
 
         # Set up stat loggers; independent set for each DP rank.
         self.stat_loggers: list[list[StatLoggerBase]] = setup_default_loggers(
@@ -502,6 +511,21 @@ class AsyncLLM(EngineClient):
     async def pin_lora(self, lora_id: int) -> bool:
         """Prevent an adapter from being evicted."""
         return await self.engine_core.pin_lora_async(lora_id)
+
+    async def set_runtime_roe_hint(self, enable: Optional[bool],
+                                   K: Optional[int] = None,
+                                   tau: Optional[float] = None) -> None:
+        """Override RoE behaviour for subsequent decode steps."""
+        roe_config = getattr(self.vllm_config, "roe_config", None)
+        if roe_config is None:
+            logger.debug("set_runtime_roe_hint ignored: RoeConfig unavailable.")
+            return
+
+        hint = roe_config.build_runtime_hint(enable, K, tau)
+        async with self._runtime_roe_lock:
+            self._runtime_roe_hint = hint
+        roe_config.set_runtime_hint(hint)
+        await self.engine_core.set_runtime_roe_hint_async(enable, K, tau)
 
     async def collective_rpc(self,
                              method: str,
