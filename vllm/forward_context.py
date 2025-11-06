@@ -39,6 +39,7 @@ class DPMetadata:
 class RoeForwardMetadata:
     sample_indices: Optional[torch.Tensor]
     num_samples: int
+    base_indices: Optional[torch.Tensor] = None
     step: Optional[int] = None
 
 

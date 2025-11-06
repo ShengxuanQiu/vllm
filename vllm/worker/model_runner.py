@@ -1248,6 +1248,9 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
     ) -> ModelInputForGPUWithSamplingMetadata:
         roe_config = getattr(self.vllm_config, "roe_config", None)
         attn_metadata = model_input.attn_metadata
+        if attn_metadata is not None:
+            attn_metadata.roe_sample_indices = None
+            attn_metadata.roe_base_indices = None
 
         runtime_hint = self._get_runtime_roe_hint()
         if runtime_hint is None and roe_config is not None:
@@ -1447,6 +1450,17 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
             ).repeat_interleave(num_decode_tokens)
             sample_indices[input_tokens.shape[0]:] = replicate_assignments
         attn_metadata.roe_sample_indices = sample_indices
+        base_indices = torch.full((expanded_tokens.shape[0], ),
+                                  -1,
+                                  dtype=torch.int32,
+                                  device=device)
+        base_range = torch.arange(num_decode_tokens,
+                                  device=device,
+                                  dtype=torch.int32)
+        base_indices[decode_start:decode_end] = base_range
+        if extra > 0:
+            base_indices[input_tokens.shape[0]:] = base_range.repeat(extra)
+        attn_metadata.roe_base_indices = base_indices
 
         attn_metadata.roe_info = RoeBatchInfo(
             clean_num_decode_tokens=num_decode_tokens,
@@ -2126,8 +2140,13 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_start.record()
 
         if not bypass_model_exec:
+            roe_config_obj = getattr(self.vllm_config, "roe_config", None)
+            if roe_config_obj is not None:
+                roe_config_obj.reset_step_state()
             roe_sample_indices = getattr(model_input.attn_metadata,
                                          "roe_sample_indices", None)
+            roe_base_indices = getattr(model_input.attn_metadata,
+                                       "roe_base_indices", None)
             roe_num_samples = getattr(model_input.attn_metadata,
                                       "roe_num_samples", 1)
             roe_forward_meta = None
@@ -2136,6 +2155,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 roe_forward_meta = RoeForwardMetadata(
                     sample_indices=roe_sample_indices,
                     num_samples=roe_num_samples,
+                    base_indices=roe_base_indices,
                     step=step)
             with set_forward_context(model_input.attn_metadata,
                                      self.vllm_config, virtual_engine,

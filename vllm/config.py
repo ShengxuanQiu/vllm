@@ -3224,6 +3224,18 @@ class RoeConfig:
     """Number of earliest MoE layers that remain deterministic."""
     skip_back: int = 0
     """Number of latest MoE layers that remain deterministic."""
+    div_progressive: bool = True
+    """Enable progressive diversity penalty across RoE replicas within a decode step."""
+    div_penalty: float = 0.2
+    """Base penalty strength applied when discouraging previously selected experts."""
+    div_gamma: float = 1.0
+    """Exponent used in (1 - p)**gamma when weighting penalties by router probabilities."""
+    div_cap: float = 0.0
+    """Maximum penalty applied to an expert for a single replica; 0 disables the cap."""
+    div_norm: bool = True
+    """Normalize penalty magnitude by the number of experts being penalized."""
+    div_anneal: Optional[str] = None
+    """Optional annealing schedule spec for the penalty strength (e.g. 'linear:t_start=32,t_end=256,lambda_max=0.3')."""
 
     debug: bool = False
     """Enable verbose RoE debugging (adds logging and instrumentation)."""
@@ -3239,6 +3251,12 @@ class RoeConfig:
     _runtime_hint: Optional[RoeRuntimeHint] = field(
         init=False, default=None, repr=False)
     """Optional runtime override applied on top of the static configuration."""
+    _step_mask_selected: Optional[torch.Tensor] = field(
+        init=False, default=None, repr=False)
+    """Per-step mask tracking experts selected by previous replicas [B_base, E]."""
+    _div_anneal_fn: Optional[Callable[[int], float]] = field(
+        init=False, default=None, repr=False)
+    """Cached callable mapping decode step index to effective penalty strength."""
 
     def compute_hash(self) -> str:
         factors: list[Any] = [
@@ -3247,6 +3265,12 @@ class RoeConfig:
             self.taus,
             self.skip_front,
             self.skip_back,
+            self.div_progressive,
+            self.div_penalty,
+            self.div_gamma,
+            self.div_cap,
+            self.div_norm,
+            self.div_anneal,
             self.debug,
             self.debug_path,
         ]
@@ -3270,6 +3294,8 @@ class RoeConfig:
         self._total_layers = 0
         self._layer_prefix_to_index.clear()
         self._runtime_hint = None
+        self._div_anneal_fn = None
+        self.reset_step_state()
 
     def register_layer(self, prefix: str) -> int:
         idx = self._layer_counter
@@ -3312,6 +3338,71 @@ class RoeConfig:
     def get_runtime_hint(self) -> Optional[RoeRuntimeHint]:
         """Return the currently active runtime override, if any."""
         return self._runtime_hint
+
+    def reset_step_state(self) -> None:
+        """Clear per-step caches that should not persist across decode steps."""
+        self._step_mask_selected = None
+
+    def _build_div_anneal_fn(self, spec: str) -> Callable[[int], float]:
+        spec = spec.strip()
+        if not spec:
+            raise ValueError("RoE diversity anneal spec cannot be empty.")
+        mode, sep, params_str = spec.partition(":")
+        mode = mode.strip().lower() or "linear"
+        param_map: dict[str, str] = {}
+        if params_str:
+            for item in params_str.split(","):
+                if not item:
+                    continue
+                key, value_sep, value = item.partition("=")
+                if not value_sep:
+                    raise ValueError(
+                        f"Invalid RoE diversity anneal parameter '{item}' in spec '{spec}'.")
+                param_map[key.strip()] = value.strip()
+
+        if mode == "linear":
+            t_start = int(param_map.get("t_start", 0))
+            t_end = int(param_map.get("t_end", t_start))
+            lambda_max = float(param_map.get("lambda_max", self.div_penalty))
+            lambda_min = float(param_map.get("lambda_min", 0.0))
+
+            if t_end < t_start:
+                t_end = t_start
+
+            def schedule(step: int) -> float:
+                if step < t_start:
+                    return lambda_min
+                if step >= t_end or t_end == t_start:
+                    return lambda_max
+                span = max(1, t_end - t_start)
+                alpha = (step - t_start) / span
+                return lambda_min + alpha * (lambda_max - lambda_min)
+
+            return schedule
+
+        raise ValueError(
+            f"Unsupported RoE diversity anneal mode '{mode}' in spec '{spec}'.")
+
+    def _ensure_div_anneal_fn(self) -> Optional[Callable[[int], float]]:
+        if not self.div_anneal:
+            self._div_anneal_fn = None
+            return None
+        if self._div_anneal_fn is None:
+            self._div_anneal_fn = self._build_div_anneal_fn(self.div_anneal)
+        return self._div_anneal_fn
+
+    def get_diversity_lambda(self, step: Optional[int]) -> float:
+        """Return the effective diversity penalty for the given decode step."""
+        base = max(0.0, float(self.div_penalty))
+        if base == 0.0:
+            return 0.0
+        fn = self._ensure_div_anneal_fn()
+        if fn is None:
+            return base
+        if step is None:
+            return base
+        value = float(fn(max(0, int(step))))
+        return max(0.0, value)
 
 
     def build_runtime_hint(

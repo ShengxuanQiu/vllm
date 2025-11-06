@@ -315,6 +315,12 @@ class EngineArgs:
     roe_skip_front: int = 0
     roe_skip_back: int = 0
     roe_debug: bool = False
+    roe_div_progressive: bool = True
+    roe_div_penalty: float = 0.2
+    roe_div_gamma: float = 1.0
+    roe_div_cap: float = 0.0
+    roe_div_norm: bool = True
+    roe_div_anneal: Optional[str] = None
 
     guided_decoding_backend: str = DecodingConfig.guided_decoding_backend
     logits_processor_pattern: Optional[str] = None
@@ -365,6 +371,16 @@ class EngineArgs:
         if self.roe_skip_front < 0 or self.roe_skip_back < 0:
             raise ValueError('roe_skip_front and roe_skip_back must be non-negative.')
         self.roe_debug = bool(self.roe_debug)
+        if self.roe_div_penalty < 0:
+            raise ValueError('roe_div_penalty must be >= 0.')
+        if self.roe_div_gamma < 0:
+            raise ValueError('roe_div_gamma must be >= 0.')
+        if self.roe_div_cap < 0:
+            raise ValueError('roe_div_cap must be >= 0.')
+        self.roe_div_progressive = bool(self.roe_div_progressive)
+        self.roe_div_norm = bool(self.roe_div_norm)
+        if isinstance(self.roe_div_anneal, str) and self.roe_div_anneal.strip() == "":
+            self.roe_div_anneal = None
 
         if self.enable_roe:
             if self.enforce_eager is False:
@@ -542,6 +558,36 @@ class EngineArgs:
             action=argparse.BooleanOptionalAction,
             default=EngineArgs.roe_debug,
             help='Enable verbose RoE debugging (logs per-layer gate statistics).')
+        parser.add_argument(
+            '--roe-div-progressive',
+            action=argparse.BooleanOptionalAction,
+            default=EngineArgs.roe_div_progressive,
+            help='Enable progressive diversity penalties across RoE replicas.')
+        parser.add_argument(
+            '--roe-div-penalty',
+            type=float,
+            default=EngineArgs.roe_div_penalty,
+            help='Base penalty strength applied to experts previously selected by earlier replicas.')
+        parser.add_argument(
+            '--roe-div-gamma',
+            type=float,
+            default=EngineArgs.roe_div_gamma,
+            help='Exponent applied to (1 - p) when computing diversity penalty weights.')
+        parser.add_argument(
+            '--roe-div-cap',
+            type=float,
+            default=EngineArgs.roe_div_cap,
+            help='Maximum per-expert penalty; set 0 to disable capping.')
+        parser.add_argument(
+            '--roe-div-norm',
+            action=argparse.BooleanOptionalAction,
+            default=EngineArgs.roe_div_norm,
+            help='Normalize penalty magnitude by the number of penalized experts.')
+        parser.add_argument(
+            '--roe-div-anneal',
+            type=optional_type(str),
+            default=EngineArgs.roe_div_anneal,
+            help='Optional annealing schedule for diversity penalty (e.g. linear:t_start=32,t_end=256,lambda_max=0.3).')
 
         # Guided decoding arguments
         guided_decoding_kwargs = get_kwargs(DecodingConfig)
@@ -1316,6 +1362,12 @@ class EngineArgs:
             skip_front=self.roe_skip_front,
             skip_back=self.roe_skip_back,
             debug=self.roe_debug,
+            div_progressive=self.roe_div_progressive,
+            div_penalty=self.roe_div_penalty,
+            div_gamma=self.roe_div_gamma,
+            div_cap=self.roe_div_cap,
+            div_norm=self.roe_div_norm,
+            div_anneal=self.roe_div_anneal,
         )
 
         show_hidden_metrics = False
