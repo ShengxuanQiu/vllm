@@ -21,7 +21,7 @@ from vllm.config import (BlockSize, CacheConfig, CacheDType, CompilationConfig,
                          GuidedDecodingBackendV1, HfOverrides,
                          KVTransferConfig, LoadConfig, LoadFormat, LoRAConfig,
                          ModelConfig, ModelImpl, MultiModalConfig,
-                         ObservabilityConfig, RoeConfig, ParallelConfig, PoolerConfig,
+                         ObservabilityConfig, RoeConfig, LayerAggConfig, ParallelConfig, PoolerConfig,
                          PrefixCachingHashAlgo, PromptAdapterConfig,
                          SchedulerConfig, SchedulerPolicy, SpeculativeConfig,
                          TaskOption, TokenizerPoolConfig, VllmConfig,
@@ -315,6 +315,16 @@ class EngineArgs:
     roe_skip_front: int = 0
     roe_skip_back: int = 0
     roe_debug: bool = False
+    roe_div_progressive: bool = True
+    roe_div_penalty: float = 0.2
+    roe_div_gamma: float = 1.0
+    roe_div_cap: float = 0.0
+    roe_div_norm: bool = True
+    roe_div_anneal: Optional[str] = None
+
+    # Layer aggregation fields
+    use_layer_agg: bool = False
+    layer_agg_k: int = LayerAggConfig.k
 
     guided_decoding_backend: str = DecodingConfig.guided_decoding_backend
     logits_processor_pattern: Optional[str] = None
@@ -365,6 +375,20 @@ class EngineArgs:
         if self.roe_skip_front < 0 or self.roe_skip_back < 0:
             raise ValueError('roe_skip_front and roe_skip_back must be non-negative.')
         self.roe_debug = bool(self.roe_debug)
+        if self.roe_div_penalty < 0:
+            raise ValueError('roe_div_penalty must be >= 0.')
+        if self.roe_div_gamma < 0:
+            raise ValueError('roe_div_gamma must be >= 0.')
+        if self.roe_div_cap < 0:
+            raise ValueError('roe_div_cap must be >= 0.')
+        self.roe_div_progressive = bool(self.roe_div_progressive)
+        self.roe_div_norm = bool(self.roe_div_norm)
+        if isinstance(self.roe_div_anneal, str) and self.roe_div_anneal.strip() == "":
+            self.roe_div_anneal = None
+
+        self.use_layer_agg = bool(self.use_layer_agg)
+        if self.layer_agg_k < 1:
+            raise ValueError("layer_agg_k must be >= 1.")
 
         if self.enable_roe:
             if self.enforce_eager is False:
@@ -542,6 +566,46 @@ class EngineArgs:
             action=argparse.BooleanOptionalAction,
             default=EngineArgs.roe_debug,
             help='Enable verbose RoE debugging (logs per-layer gate statistics).')
+        parser.add_argument(
+            '--roe-div-progressive',
+            action=argparse.BooleanOptionalAction,
+            default=EngineArgs.roe_div_progressive,
+            help='Enable progressive diversity penalties across RoE replicas.')
+        parser.add_argument(
+            '--roe-div-penalty',
+            type=float,
+            default=EngineArgs.roe_div_penalty,
+            help='Base penalty strength applied to experts previously selected by earlier replicas.')
+        parser.add_argument(
+            '--roe-div-gamma',
+            type=float,
+            default=EngineArgs.roe_div_gamma,
+            help='Exponent applied to (1 - p) when computing diversity penalty weights.')
+        parser.add_argument(
+            '--roe-div-cap',
+            type=float,
+            default=EngineArgs.roe_div_cap,
+            help='Maximum per-expert penalty; set 0 to disable capping.')
+        parser.add_argument(
+            '--roe-div-norm',
+            action=argparse.BooleanOptionalAction,
+            default=EngineArgs.roe_div_norm,
+            help='Normalize penalty magnitude by the number of penalized experts.')
+        parser.add_argument(
+            '--roe-div-anneal',
+            type=optional_type(str),
+            default=EngineArgs.roe_div_anneal,
+            help='Optional annealing schedule for diversity penalty (e.g. linear:t_start=32,t_end=256,lambda_max=0.3).')
+        parser.add_argument(
+            '--use-layer-agg',
+            action=argparse.BooleanOptionalAction,
+            default=EngineArgs.use_layer_agg,
+            help='Enable aggregation of logits from the last K decoder layers.')
+        parser.add_argument(
+            '--layer-agg-k',
+            type=int,
+            default=EngineArgs.layer_agg_k,
+            help='Number of top layers to aggregate when layer aggregation is enabled.')
 
         # Guided decoding arguments
         guided_decoding_kwargs = get_kwargs(DecodingConfig)
@@ -1175,6 +1239,11 @@ class EngineArgs:
         else:
             envs.set_vllm_use_v1(use_v1)
 
+        if self.use_layer_agg and not use_v1:
+            raise ValueError(
+                "Layer aggregation (--use-layer-agg) is only supported with "
+                "the V1 engine.")
+
         # Set default arguments for V0 or V1 Engine.
         if use_v1:
             self._set_default_args_v1(usage_context)
@@ -1316,6 +1385,16 @@ class EngineArgs:
             skip_front=self.roe_skip_front,
             skip_back=self.roe_skip_back,
             debug=self.roe_debug,
+            div_progressive=self.roe_div_progressive,
+            div_penalty=self.roe_div_penalty,
+            div_gamma=self.roe_div_gamma,
+            div_cap=self.roe_div_cap,
+            div_norm=self.roe_div_norm,
+            div_anneal=self.roe_div_anneal,
+        )
+        layer_agg_config = LayerAggConfig(
+            enabled=self.use_layer_agg,
+            k=self.layer_agg_k,
         )
 
         show_hidden_metrics = False
@@ -1351,6 +1430,7 @@ class EngineArgs:
             load_config=load_config,
             decoding_config=decoding_config,
             roe_config=roe_config,
+            layer_agg_config=layer_agg_config,
             observability_config=observability_config,
             prompt_adapter_config=prompt_adapter_config,
             compilation_config=self.compilation_config,

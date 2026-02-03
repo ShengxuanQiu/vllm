@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import time
+import uuid
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from typing import Optional, Union
@@ -758,6 +760,52 @@ class Scheduler(SchedulerInterface):
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
+
+    def _clone_request(self, parent: Request,
+                       new_request_id: str) -> Request:
+        sampling_params = parent.sampling_params.clone()
+        clone = Request(
+            request_id=new_request_id,
+            prompt_token_ids=list(parent.prompt_token_ids),
+            multi_modal_inputs=copy.deepcopy(parent.mm_inputs),
+            multi_modal_hashes=list(parent.mm_hashes),
+            multi_modal_placeholders=copy.deepcopy(parent.mm_positions),
+            sampling_params=sampling_params,
+            eos_token_id=parent.eos_token_id,
+            arrival_time=time.time(),
+            lora_request=parent.lora_request,
+            structured_output_request=copy.deepcopy(
+                parent.structured_output_request)
+            if parent.structured_output_request is not None else None,
+        )
+        clone.status = (RequestStatus.WAITING_FOR_FSM
+                        if sampling_params.guided_decoding is not None else
+                        RequestStatus.WAITING)
+        clone._output_token_ids.extend(parent.output_token_ids)
+        clone._all_token_ids.extend(parent.output_token_ids)
+        clone.spec_token_ids = list(parent.spec_token_ids)
+        clone.num_computed_tokens = parent.num_computed_tokens
+        clone.stop_reason = None
+        return clone
+
+    def fork_request(self, request_id: str, n: int) -> list[str]:
+        if n <= 0:
+            return []
+        parent = self.requests.get(request_id)
+        if parent is None:
+            raise ValueError(f"request_id={request_id} 不存在，无法 fork")
+        if parent.has_encoder_inputs:
+            raise NotImplementedError(
+                "当前实现尚未支持包含多模态编码缓存的请求 fork")
+        forked_ids: list[str] = []
+        for _ in range(n):
+            new_request_id = f"{request_id}_fork_{uuid.uuid4().hex[:8]}"
+            clone = self._clone_request(parent, new_request_id)
+            self.requests[new_request_id] = clone
+            self.waiting.appendleft(clone)
+            self.kv_cache_manager.fork_request(parent, clone)
+            forked_ids.append(new_request_id)
+        return forked_ids
 
     def finish_requests(
         self,

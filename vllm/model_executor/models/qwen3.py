@@ -31,6 +31,7 @@ from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
@@ -241,6 +242,87 @@ class Qwen3Model(Qwen2Model):
         super().__init__(vllm_config=vllm_config,
                          prefix=prefix,
                          decoder_layer_type=Qwen3DecoderLayer)
+        self.layer_agg_enabled: bool = False
+        self.layer_agg_k: int = 0
+        self._layer_agg_hidden: Optional[torch.Tensor] = None
+
+    def set_layer_agg_config(self, enabled: bool, k: int) -> None:
+        self.layer_agg_enabled = enabled
+        self.layer_agg_k = k
+
+    def pop_layer_agg_hidden(self) -> Optional[torch.Tensor]:
+        hidden = self._layer_agg_hidden
+        self._layer_agg_hidden = None
+        return hidden
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        self._layer_agg_hidden = None
+        capture_layer_agg = self.layer_agg_enabled and get_pp_group(
+        ).is_last_rank
+        layer_agg_positions: Optional[torch.Tensor] = None
+        layer_agg_start = 0
+        captured_tokens: list[tuple[torch.Tensor,
+                                    Optional[torch.Tensor]]] = []
+        if capture_layer_agg:
+            try:
+                layer_agg_positions = get_forward_context().logits_indices
+            except Exception:
+                layer_agg_positions = None
+            if layer_agg_positions is None or layer_agg_positions.numel() == 0:
+                capture_layer_agg = False
+            else:
+                total_layers = len(self.layers)
+                layer_agg_start = max(
+                    0, total_layers - min(self.layer_agg_k, total_layers))
+
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.get_input_embeddings(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+        for idx, layer in enumerate(self.layers[self.start_layer:self.end_layer
+                                                ]):
+            layer_idx = idx + self.start_layer
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                residual,
+            )
+            if capture_layer_agg and layer_idx >= layer_agg_start:
+                token_hidden = hidden_states[layer_agg_positions]
+                token_residual = (None if residual is None else
+                                  residual[layer_agg_positions])
+                captured_tokens.append((token_hidden, token_residual))
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({
+                "hidden_states": hidden_states,
+                "residual": residual
+            })
+        hidden_states, _ = self.norm(hidden_states, residual)
+        if capture_layer_agg and layer_agg_positions is not None:
+            normed_tokens: list[torch.Tensor] = []
+            if captured_tokens:
+                for token_hidden, token_residual in captured_tokens[:-1]:
+                    normed = self.norm.forward_native(token_hidden,
+                                                      token_residual)
+                    normed_tokens.append(normed[0]
+                                         if isinstance(normed, tuple) else
+                                         normed)
+            normed_tokens.append(hidden_states[layer_agg_positions])
+            if normed_tokens:
+                self._layer_agg_hidden = torch.stack(normed_tokens, dim=0)
+        return hidden_states
 
 
 class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
@@ -268,6 +350,13 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.quant_config = quant_config
         self.model = Qwen3Model(vllm_config=vllm_config,
                                 prefix=maybe_prefix(prefix, "model"))
+        layer_agg_cfg = vllm_config.layer_agg_config
+        self.supports_layer_agg = True
+        self.layer_agg_enabled = (
+            layer_agg_cfg.is_enabled() if layer_agg_cfg else False)
+        self.layer_agg_k = layer_agg_cfg.k if layer_agg_cfg else 0
+        self.model.set_layer_agg_config(self.layer_agg_enabled,
+                                        self.layer_agg_k)
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:

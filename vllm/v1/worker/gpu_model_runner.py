@@ -43,6 +43,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.utils import is_spec_decode_supported
+from vllm.v1.layer_aggregation import aggregate_from_hidden_states
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -180,6 +181,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     raise ValueError("Unknown speculative decoding method: "
                                      f"{self.speculative_config.method}")
                 self.rejection_sampler = RejectionSampler()
+
+        layer_agg_cfg = vllm_config.layer_agg_config
+        self.use_layer_agg = bool(layer_agg_cfg and layer_agg_cfg.is_enabled())
+        self.layer_agg_k = layer_agg_cfg.k if layer_agg_cfg else 0
+        self._layer_agg_warned = False
+        if self.use_layer_agg and (
+                self.parallel_config.pipeline_parallel_size > 1
+                or self.model_config.is_encoder_decoder):
+            logger.warning(
+                "Layer aggregation is disabled for pipeline or encoder-decoder "
+                "models; falling back to baseline logits.")
+            self.use_layer_agg = False
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -1088,7 +1101,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Run the decoder.
         # Use persistent buffers for CUDA graphs.
-        with set_forward_context(attn_metadata, self.vllm_config):
+        with set_forward_context(attn_metadata,
+                                 self.vllm_config,
+                                 logits_indices=logits_indices):
             output = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -1107,7 +1122,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         hidden_states = hidden_states[:num_scheduled_tokens]
         sample_hidden_states = hidden_states[logits_indices]
-        logits = self.model.compute_logits(sample_hidden_states, None)
+        logits = None
+        if self.use_layer_agg:
+            pop_fn = getattr(self.model, "pop_layer_agg_hidden", None)
+            if callable(pop_fn):
+                layer_agg_hidden = pop_fn()
+                if layer_agg_hidden is not None:
+                    logits = aggregate_from_hidden_states(
+                        layer_agg_hidden,
+                        self.model.compute_logits,
+                        None,
+                    )
+                elif not self._layer_agg_warned:
+                    logger.warning(
+                        "Layer aggregation requested but no intermediate "
+                        "states were captured; using final layer logits.")
+                    self._layer_agg_warned = True
+            elif not self._layer_agg_warned:
+                logger.warning(
+                    "Layer aggregation requested but model does not support "
+                    "it; using final layer logits.")
+                self._layer_agg_warned = True
+                self.use_layer_agg = False
+
+        if logits is None:
+            logits = self.model.compute_logits(sample_hidden_states, None)
 
         # Apply structured output bitmasks if present
         if scheduler_output.grammar_bitmask is not None:
@@ -1342,6 +1381,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.use_aux_hidden_state_outputs:
                 self.model.set_aux_hidden_state_layers(
                     self.model.get_eagle3_aux_hidden_state_layers())
+            if hasattr(self.model, "set_layer_agg_config"):
+                self.model.set_layer_agg_config(self.use_layer_agg,
+                                                self.layer_agg_k)
+            elif self.use_layer_agg and not self._layer_agg_warned:
+                logger.warning(
+                    "Layer aggregation requested but not supported by this "
+                    "model; using baseline logits instead.")
+                self._layer_agg_warned = True
+                self.use_layer_agg = False
             time_after_load = time.perf_counter()
         self.model_memory_usage = m.consumed_memory
         logger.info("Model loading took %.4f GiB and %.6f seconds",

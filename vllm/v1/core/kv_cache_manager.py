@@ -4,6 +4,8 @@ from collections import defaultdict
 from collections.abc import Iterable
 from typing import Optional
 
+from requests import request
+
 from vllm.logger import init_logger
 from vllm.utils import cdiv, sha256
 from vllm.v1.core.block_pool import BlockPool
@@ -292,6 +294,27 @@ class KVCacheManager:
         self.num_cached_block[
             request.request_id] = num_full_blocks_after_append
         return new_blocks
+
+    def fork_request(self, parent: Request, child: Request) -> None:
+        """
+        Clone the KV metadata of `parent` into `child`, increasing block refcounts
+        so两条请求可共享已计算的上下文。
+        """
+        parent_blocks = self.req_to_blocks.get(parent.request_id)
+        if not parent_blocks:
+            raise ValueError(
+                f"request {parent.request_id} 无可复用的 KV，无法 fork")
+        cloned_blocks: list[KVCacheBlock] = []
+        for blk in parent_blocks:
+            blk.incr_ref()
+            cloned_blocks.append(blk)
+        self.req_to_blocks[child.request_id] = cloned_blocks
+        parent_hashes = self.req_to_block_hashes.get(parent.request_id, [])
+        if parent_hashes:
+            self.req_to_block_hashes[child.request_id] = list(parent_hashes)
+        if parent.request_id in self.num_cached_block:
+            self.num_cached_block[child.request_id] = self.num_cached_block[
+                parent.request_id]
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.

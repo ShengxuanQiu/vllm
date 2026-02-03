@@ -2,12 +2,13 @@
 
 from collections.abc import Mapping
 from copy import copy
-from typing import Any, Callable, Optional, Union
+from threading import Lock
+from typing import Any, Callable, Optional, Union, Iterable
 
 from typing_extensions import TypeVar
 
 import vllm.envs as envs
-from vllm.config import ParallelConfig, VllmConfig
+from vllm.config import ParallelConfig, VllmConfig, RoeRuntimeHint
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
@@ -63,6 +64,15 @@ class LLMEngine:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
+
+        roe_config = getattr(self.vllm_config, "roe_config", None)
+        runtime_hint: Optional[RoeRuntimeHint]
+        if roe_config is not None:
+            runtime_hint = roe_config.get_runtime_hint()
+        else:
+            runtime_hint = None
+        self._runtime_roe_hint_lock = Lock()
+        self._runtime_roe_hint: Optional[RoeRuntimeHint] = runtime_hint
 
         # important: init dp group before init the engine_core
         # In the decoupled engine case this is handled in EngineCoreProc.
@@ -168,6 +178,16 @@ class LLMEngine:
         request_ids = self.output_processor.abort_requests(request_ids)
         self.engine_core.abort_requests(request_ids)
 
+    def abort_requests(self, request_ids: Iterable[str]) -> None:
+        if not request_ids:
+            return
+        self.abort_request(list(request_ids))
+
+    def fork_request(self, request_id: str, n: int) -> list[str]:
+        if n <= 0:
+            return []
+        return self.engine_core.fork_request(request_id, n)
+
     def add_request(
         self,
         request_id: str,
@@ -272,6 +292,23 @@ class LLMEngine:
     def pin_lora(self, lora_id: int) -> bool:
         """Prevent an adapter from being evicted."""
         return self.engine_core.pin_lora(lora_id)
+
+    def set_runtime_roe_hint(self,
+                             enable: Optional[bool],
+                             K: Optional[int] = None,
+                             tau: Optional[float] = None) -> None:
+        """Override RoE behaviour for subsequent decode steps."""
+        roe_config = getattr(self.vllm_config, "roe_config", None)
+        if roe_config is None:
+            logger.debug("set_runtime_roe_hint ignored: RoeConfig unavailable.")
+            return
+
+        hint = roe_config.build_runtime_hint(enable, K, tau)
+
+        with self._runtime_roe_hint_lock:
+            self._runtime_roe_hint = hint
+        roe_config.set_runtime_hint(hint)
+        self.engine_core.set_runtime_roe_hint(enable, K, tau)
 
     def collective_rpc(self,
                        method: Union[str, Callable[..., _R]],

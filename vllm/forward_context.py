@@ -39,6 +39,7 @@ class DPMetadata:
 class RoeForwardMetadata:
     sample_indices: Optional[torch.Tensor]
     num_samples: int
+    base_indices: Optional[torch.Tensor] = None
     step: Optional[int] = None
 
 
@@ -53,6 +54,7 @@ class ForwardContext:
     # set dynamically for each forward pass
     dp_metadata: Optional[DPMetadata] = None
     roe_metadata: Optional[RoeForwardMetadata] = None
+    logits_indices: Optional[torch.Tensor] = None
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -71,7 +73,8 @@ def set_forward_context(attn_metadata: Any,
                         vllm_config: VllmConfig,
                         virtual_engine: int = 0,
                         num_tokens: int = 0,
-                        roe_metadata: Optional[RoeForwardMetadata] = None):
+                        roe_metadata: Optional[RoeForwardMetadata] = None,
+                        logits_indices: Optional[torch.Tensor] = None):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     Here we can inject common logic for every model forward pass.
@@ -112,7 +115,8 @@ def set_forward_context(attn_metadata: Any,
         virtual_engine=virtual_engine,
         attn_metadata=attn_metadata,
         dp_metadata=dp_metadata,
-        roe_metadata=roe_metadata)
+        roe_metadata=roe_metadata,
+        logits_indices=logits_indices)
 
     # KVConnector: trigger (possibly async) load before forward.
     # Each attn layer will block until the reading is complete.

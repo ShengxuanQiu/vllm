@@ -10,6 +10,7 @@ import time
 import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
+from threading import Lock
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set,
                     Tuple, Type, TypeVar, Union)
 
@@ -23,7 +24,7 @@ import vllm.envs as envs
 from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.attention.backends.abstract import AttentionState
 from vllm.attention.backends.utils import CommonAttentionState, PAD_SLOT_ID
-from vllm.config import CompilationLevel, VllmConfig
+from vllm.config import CompilationLevel, VllmConfig, RoeRuntimeHint
 from vllm.core.scheduler import SchedulerOutputs
 from vllm.distributed import get_pp_group
 from vllm.distributed.kv_transfer import get_kv_transfer_group
@@ -1247,31 +1248,54 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
     ) -> ModelInputForGPUWithSamplingMetadata:
         roe_config = getattr(self.vllm_config, "roe_config", None)
         attn_metadata = model_input.attn_metadata
-        if (roe_config is None or not roe_config.enabled
-                or roe_config.num_samples <= 1 or attn_metadata is None):
+        if attn_metadata is not None:
+            attn_metadata.roe_sample_indices = None
+            attn_metadata.roe_base_indices = None
+
+        runtime_hint = self._get_runtime_roe_hint()
+        if runtime_hint is None and roe_config is not None:
+            runtime_hint = roe_config.get_runtime_hint()
+
+        num_samples = 1
+        runtime_enabled = False
+        if runtime_hint is not None:
+            runtime_enabled = runtime_hint.enable
+            if runtime_hint.enable:
+                num_samples = runtime_hint.effective_num_samples
+        elif roe_config is not None:
+            runtime_enabled = bool(roe_config.enabled)
+            num_samples = roe_config.num_samples
+
+        num_samples = max(1, int(num_samples))
+        active_roe = bool(runtime_enabled and num_samples > 1)
+
+        if attn_metadata is None or not active_roe:
             if attn_metadata is not None:
                 attn_metadata.roe_num_samples = 1
                 attn_metadata.roe_clean_decode_tokens = getattr(
                     attn_metadata, "num_decode_tokens", 0)
+            self._roe_enabled = False
             return model_input
 
         if attn_metadata.num_prefill_tokens > 0:
             logger.debug("RoE: skipping replication when prefill tokens are present.")
             attn_metadata.roe_num_samples = 1
             attn_metadata.roe_clean_decode_tokens = attn_metadata.num_decode_tokens
+            self._roe_enabled = False
             return model_input
 
         if getattr(attn_metadata, "use_cuda_graph", False):
             logger.debug("RoE: skipping replication under CUDA graph capture.")
             attn_metadata.roe_num_samples = 1
             attn_metadata.roe_clean_decode_tokens = attn_metadata.num_decode_tokens
+            self._roe_enabled = False
             return model_input
 
-        num_samples = roe_config.num_samples
         num_decode_tokens = attn_metadata.num_decode_tokens
         if num_decode_tokens == 0:
             attn_metadata.roe_num_samples = 1
             attn_metadata.roe_clean_decode_tokens = 0
+            self._roe_enabled = False
             return model_input
 
         input_tokens = model_input.input_tokens
@@ -1279,6 +1303,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         if input_tokens is None or input_positions is None:
             attn_metadata.roe_num_samples = 1
             attn_metadata.roe_clean_decode_tokens = num_decode_tokens
+            self._roe_enabled = False
             return model_input
 
         device = input_tokens.device
@@ -1289,8 +1314,10 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         if decode_tokens_tensor.numel() == 0:
             attn_metadata.roe_num_samples = 1
             attn_metadata.roe_clean_decode_tokens = num_decode_tokens
+            self._roe_enabled = False
             return model_input
 
+        self._roe_enabled = True
         extra = num_samples - 1
         expanded_tokens = torch.cat(
             [input_tokens, decode_tokens_tensor.repeat(extra)], dim=0)
@@ -1423,6 +1450,17 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
             ).repeat_interleave(num_decode_tokens)
             sample_indices[input_tokens.shape[0]:] = replicate_assignments
         attn_metadata.roe_sample_indices = sample_indices
+        base_indices = torch.full((expanded_tokens.shape[0], ),
+                                  -1,
+                                  dtype=torch.int32,
+                                  device=device)
+        base_range = torch.arange(num_decode_tokens,
+                                  device=device,
+                                  dtype=torch.int32)
+        base_indices[decode_start:decode_end] = base_range
+        if extra > 0:
+            base_indices[input_tokens.shape[0]:] = base_range.repeat(extra)
+        attn_metadata.roe_base_indices = base_indices
 
         attn_metadata.roe_info = RoeBatchInfo(
             clean_num_decode_tokens=num_decode_tokens,
@@ -1523,6 +1561,18 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         except Exception:
             logger.exception("RoE aggregation failed; falling back to clean logits.")
             return finalize(logits, sampling_metadata, False)
+
+    def set_runtime_roe_hint(self, hint: Optional[RoeRuntimeHint]) -> None:
+        """Receive runtime RoE override from the driver worker."""
+        with self._runtime_roe_lock:
+            self._runtime_roe_hint = hint
+        roe_config = getattr(self.vllm_config, "roe_config", None)
+        if roe_config is not None:
+            roe_config.set_runtime_hint(hint)
+
+    def _get_runtime_roe_hint(self) -> Optional[RoeRuntimeHint]:
+        with self._runtime_roe_lock:
+            return self._runtime_roe_hint
 
     @torch.inference_mode()
     def profile_run(self) -> None:
@@ -1932,12 +1982,19 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                          return_hidden_states=return_hidden_states,
                          input_registry=input_registry,
                          mm_registry=mm_registry)
+        roe_config = getattr(self.vllm_config, "roe_config", None)
+        runtime_hint: Optional[RoeRuntimeHint]
+        if roe_config is not None:
+            runtime_hint = roe_config.get_runtime_hint()
+        else:
+            runtime_hint = None
+        self._runtime_roe_lock = Lock()
+        self._runtime_roe_hint: Optional[RoeRuntimeHint] = runtime_hint
         self._roe_decode_step = 0
         self._roe_last_shapes = None
-        self._roe_debug = bool(getattr(self.vllm_config.roe_config, 'debug', False)
-                               if getattr(self.vllm_config, 'roe_config', None) else False)
-        self._roe_enabled = bool(getattr(self.vllm_config.roe_config, 'enabled', False)
-                                 if getattr(self.vllm_config, 'roe_config', None) else False)
+        self._roe_debug = bool(getattr(roe_config, "debug", False)) if roe_config else False
+        self._roe_enabled = bool(runtime_hint.is_active if runtime_hint
+                                 else (roe_config.enabled if roe_config else False))
 
     def make_model_input_from_broadcasted_tensor_dict(
         self,
@@ -2083,8 +2140,13 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_start.record()
 
         if not bypass_model_exec:
+            roe_config_obj = getattr(self.vllm_config, "roe_config", None)
+            if roe_config_obj is not None:
+                roe_config_obj.reset_step_state()
             roe_sample_indices = getattr(model_input.attn_metadata,
                                          "roe_sample_indices", None)
+            roe_base_indices = getattr(model_input.attn_metadata,
+                                       "roe_base_indices", None)
             roe_num_samples = getattr(model_input.attn_metadata,
                                       "roe_num_samples", 1)
             roe_forward_meta = None
@@ -2093,6 +2155,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 roe_forward_meta = RoeForwardMetadata(
                     sample_indices=roe_sample_indices,
                     num_samples=roe_num_samples,
+                    base_indices=roe_base_indices,
                     step=step)
             with set_forward_context(model_input.attn_metadata,
                                      self.vllm_config, virtual_engine,

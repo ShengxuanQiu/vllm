@@ -204,17 +204,49 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
     ) -> torch.Tensor:
-        topk_weights, topk_ids = FusedMoE.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias)
+        use_diversity = False
+        if hasattr(layer, "_select_experts_with_diversity"):
+            roe_config = getattr(layer, "roe_config", None)
+            if roe_config is not None and getattr(
+                    roe_config, "div_progressive", False):
+                try:
+                    context = get_forward_context()
+                except AssertionError:
+                    context = None
+                roe_meta = getattr(context, "roe_metadata", None) if context else None
+                step_mask = getattr(roe_config, "_step_mask_selected", None)
+                base_indices = getattr(roe_meta, "base_indices", None)
+                sample_indices = getattr(roe_meta, "sample_indices", None)
+                step = getattr(roe_meta, "step", None) if roe_meta else None
+                lambda_eff = float(
+                    roe_config.get_diversity_lambda(step))
+                if (lambda_eff > 0.0 and router_logits.numel() > 0
+                        and sample_indices is not None
+                        and base_indices is not None):
+                    use_diversity = True
+                    topk_weights, topk_ids = layer._select_experts_with_diversity(  # type: ignore[assignment]
+                        hidden_states=x,
+                        router_logits=router_logits,
+                        step_mask=step_mask,
+                        base_indices=base_indices,
+                        sample_indices=sample_indices,
+                        lambda_override=lambda_eff,
+                        gamma_override=float(roe_config.div_gamma),
+                        cap_override=float(roe_config.div_cap),
+                        norm_override=bool(roe_config.div_norm),
+                    )
+        if not use_diversity:
+            topk_weights, topk_ids = FusedMoE.select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias)
         if getattr(layer, 'roe_debug_enabled', False) and getattr(layer, '_roe_debug_context', None):
             layer._log_roe_debug(topk_ids)
 
@@ -451,7 +483,7 @@ class FusedMoE(torch.nn.Module):
                   and self.tp_size * self.dp_size > 1)
 
         self.roe_config = getattr(vllm_config, "roe_config", None)
-        if self.roe_config and self.roe_config.enabled:
+        if self.roe_config:
             layer_key = prefix if prefix else f"moe_{self.roe_config.total_layers}"
             self.roe_layer_idx = self.roe_config.register_layer(layer_key)
         else:
@@ -619,6 +651,94 @@ class FusedMoE(torch.nn.Module):
         }
         return debug_ctx
 
+    def _select_experts_with_diversity(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        step_mask: Optional[torch.Tensor] = None,
+        base_indices: Optional[torch.Tensor] = None,
+        sample_indices: Optional[torch.Tensor] = None,
+        lambda_override: Optional[float] = None,
+        gamma_override: Optional[float] = None,
+        cap_override: Optional[float] = None,
+        norm_override: Optional[bool] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        def _default_select(h_states: torch.Tensor,
+                            r_logits: torch.Tensor) -> tuple[torch.Tensor,
+                                                             torch.Tensor]:
+            return FusedMoE.select_experts(
+                hidden_states=h_states,
+                router_logits=r_logits,
+                use_grouped_topk=self.use_grouped_topk,
+                top_k=self.top_k,
+                renormalize=self.renormalize,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                custom_routing_function=self.custom_routing_function,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.e_score_correction_bias,
+            )
+
+        if (not self.roe_enabled or self.roe_config is None
+                or not self.roe_config.div_progressive
+                or router_logits.ndim != 2 or router_logits.numel() == 0):
+            return _default_select(hidden_states, router_logits)
+
+        roe_config = self.roe_config
+        debug_enabled = bool(getattr(roe_config, "debug", False))
+
+        num_tokens, num_experts = router_logits.shape
+        if num_tokens == 0 or num_experts == 0:
+            return _default_select(hidden_states, router_logits)
+
+        # Reset legacy state to keep debug tooling consistent.
+        roe_config._step_mask_selected = None
+
+        lambda_penalty = float(lambda_override) if lambda_override is not None else float(getattr(roe_config, "div_penalty", 5e-3))
+        sigma_penalty = float(getattr(roe_config, "div_sigma", 2e-1))
+
+        device = router_logits.device
+
+        # ----- First sampling pass -----
+        probs_first = torch.softmax(router_logits, dim=-1)
+        _, first_top_idx = torch.topk(
+            probs_first, self.top_k, dim=-1)
+        # Gather the corresponding logits (with Gumbel noise).
+        first_top_logits = router_logits.gather(1, first_top_idx)
+
+        selected_matrix = router_logits.new_zeros((num_experts, num_tokens))
+        token_ids = torch.arange(num_tokens, device=device)
+        token_expanded = token_ids.repeat_interleave(self.top_k)
+        selected_matrix.index_put_(
+            (first_top_idx.reshape(-1), token_expanded),
+            first_top_logits.reshape(-1),
+            accumulate=True,
+        )
+
+        usage_cumsum = torch.cumsum(selected_matrix, dim=1)
+        usage_prev = torch.roll(usage_cumsum, shifts=1, dims=1)
+        usage_prev[:, 0] = 0
+
+        # ----- Second sampling with diversity-aware noise -----
+        penalty_strength = lambda_penalty * torch.tanh(usage_prev)
+        noise = torch.randn_like(penalty_strength) * sigma_penalty
+        penalty = penalty_strength * noise
+
+        second_logits = router_logits.clone()
+        second_logits -= penalty.transpose(0, 1)
+
+        gating_probs = torch.softmax(second_logits, dim=-1)
+        topk_weights, topk_ids = torch.topk(gating_probs, self.top_k, dim=-1)
+
+        if debug_enabled:
+            with torch.no_grad():
+                max_pen = float(penalty_strength.abs().max().item()) if penalty_strength.numel() else 0.0
+                logger.debug(
+                    "RoE diversity sampling layer=%s: lambda=%.4f sigma=%.4f max|penalty|=%.4f",
+                    getattr(self, "roe_layer_idx", -1), lambda_penalty, sigma_penalty, max_pen)
+
+        return topk_weights, topk_ids
     def _log_roe_debug(self, topk_ids: torch.Tensor) -> None:
         if not self.roe_debug_enabled or self.roe_debug_logger is None:
             return

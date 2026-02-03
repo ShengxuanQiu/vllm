@@ -14,7 +14,7 @@ from typing import Any, Callable, Optional, TypeVar, Union
 import msgspec
 import zmq
 
-from vllm.config import ParallelConfig, VllmConfig
+from vllm.config import ParallelConfig, VllmConfig, RoeRuntimeHint
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.logger import init_logger
@@ -59,6 +59,11 @@ class EngineCore:
                     VLLM_VERSION, vllm_config)
 
         self.log_stats = log_stats
+
+        self.vllm_config = vllm_config
+        roe_config = getattr(vllm_config, "roe_config", None)
+        self._runtime_roe_hint: Optional[RoeRuntimeHint] = (
+            roe_config.get_runtime_hint() if roe_config else None)
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -180,6 +185,9 @@ class EngineCore:
 
         self.scheduler.add_request(req)
 
+    def fork_request(self, request_id: str, n: int) -> list[str]:
+        return self.scheduler.fork_request(request_id, n)
+
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
 
@@ -287,6 +295,20 @@ class EngineCore:
 
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_executor.pin_lora(lora_id)
+
+    def set_runtime_roe_hint(self,
+                             enable: Optional[bool],
+                             K: Optional[int] = None,
+                             tau: Optional[float] = None) -> None:
+        roe_config = getattr(self.vllm_config, "roe_config", None)
+        if roe_config is None:
+            logger.debug("set_runtime_roe_hint ignored: RoeConfig unavailable.")
+            return
+
+        hint = roe_config.build_runtime_hint(enable, K, tau)
+        self._runtime_roe_hint = hint
+        roe_config.set_runtime_hint(hint)
+        self.model_executor.collective_rpc("set_runtime_roe_hint", args=(hint, ))
 
     def save_sharded_state(
         self,

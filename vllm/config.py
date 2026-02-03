@@ -3187,6 +3187,28 @@ class DecodingConfig:
                              f" must be one of {valid_guided_backends}")
 
 
+@dataclass
+class RoeRuntimeHint:
+    """Runtime override for Roster of Experts (RoE) inference."""
+
+    enable: bool
+    """Whether RoE should be enabled for the upcoming decode step."""
+    effective_num_samples: int
+    """Number of routing samples to materialize when RoE is active."""
+    effective_tau: float
+    """Temperature applied to the Gumbel noise when RoE is active."""
+
+    def __post_init__(self) -> None:
+        if self.effective_num_samples < 1:
+            self.effective_num_samples = 1
+        if self.effective_tau < 0.0:
+            self.effective_tau = 0.0
+
+    @property
+    def is_active(self) -> bool:
+        return self.enable and self.effective_num_samples > 1
+
+
 @config
 @dataclass
 class RoeConfig:
@@ -3202,6 +3224,18 @@ class RoeConfig:
     """Number of earliest MoE layers that remain deterministic."""
     skip_back: int = 0
     """Number of latest MoE layers that remain deterministic."""
+    div_progressive: bool = True
+    """Enable progressive diversity penalty across RoE replicas within a decode step."""
+    div_penalty: float = 0.2
+    """Base penalty strength applied when discouraging previously selected experts."""
+    div_gamma: float = 1.0
+    """Exponent used in (1 - p)**gamma when weighting penalties by router probabilities."""
+    div_cap: float = 0.0
+    """Maximum penalty applied to an expert for a single replica; 0 disables the cap."""
+    div_norm: bool = True
+    """Normalize penalty magnitude by the number of experts being penalized."""
+    div_anneal: Optional[str] = None
+    """Optional annealing schedule spec for the penalty strength (e.g. 'linear:t_start=32,t_end=256,lambda_max=0.3')."""
 
     debug: bool = False
     """Enable verbose RoE debugging (adds logging and instrumentation)."""
@@ -3211,8 +3245,18 @@ class RoeConfig:
     """Runtime counter used to assign sequential indices to MoE layers."""
     _total_layers: int = field(init=False, default=0, repr=False)
     """Total number of MoE layers registered during model initialisation."""
-    _layer_prefix_to_index: dict[str, int] = field(init=False, default_factory=dict, repr=False)
+    _layer_prefix_to_index: dict[str, int] = field(
+        init=False, default_factory=dict, repr=False)
     """Maps layer identifier strings to their sequential RoE indices."""
+    _runtime_hint: Optional[RoeRuntimeHint] = field(
+        init=False, default=None, repr=False)
+    """Optional runtime override applied on top of the static configuration."""
+    _step_mask_selected: Optional[torch.Tensor] = field(
+        init=False, default=None, repr=False)
+    """Per-step mask tracking experts selected by previous replicas [B_base, E]."""
+    _div_anneal_fn: Optional[Callable[[int], float]] = field(
+        init=False, default=None, repr=False)
+    """Cached callable mapping decode step index to effective penalty strength."""
 
     def compute_hash(self) -> str:
         factors: list[Any] = [
@@ -3221,6 +3265,12 @@ class RoeConfig:
             self.taus,
             self.skip_front,
             self.skip_back,
+            self.div_progressive,
+            self.div_penalty,
+            self.div_gamma,
+            self.div_cap,
+            self.div_norm,
+            self.div_anneal,
             self.debug,
             self.debug_path,
         ]
@@ -3243,6 +3293,9 @@ class RoeConfig:
         self._layer_counter = 0
         self._total_layers = 0
         self._layer_prefix_to_index.clear()
+        self._runtime_hint = None
+        self._div_anneal_fn = None
+        self.reset_step_state()
 
     def register_layer(self, prefix: str) -> int:
         idx = self._layer_counter
@@ -3262,6 +3315,11 @@ class RoeConfig:
         return self._total_layers
 
     def tau_for_layer(self, layer_idx: int) -> float:
+        runtime_hint = self._runtime_hint
+        if runtime_hint is not None:
+            if not runtime_hint.enable:
+                return 0.0
+            return runtime_hint.effective_tau
         if not self.enabled:
             return 0.0
         if layer_idx < self.skip_front:
@@ -3272,6 +3330,128 @@ class RoeConfig:
         effective_idx = max(0, layer_idx - self.skip_front)
         schedule_idx = min(effective_idx, len(self.taus) - 1)
         return self.taus[schedule_idx]
+
+    def set_runtime_hint(self, hint: Optional[RoeRuntimeHint]) -> None:
+        """Set or clear the runtime override used during decoding."""
+        self._runtime_hint = hint
+
+    def get_runtime_hint(self) -> Optional[RoeRuntimeHint]:
+        """Return the currently active runtime override, if any."""
+        return self._runtime_hint
+
+    def reset_step_state(self) -> None:
+        """Clear per-step caches that should not persist across decode steps."""
+        self._step_mask_selected = None
+
+    def _build_div_anneal_fn(self, spec: str) -> Callable[[int], float]:
+        spec = spec.strip()
+        if not spec:
+            raise ValueError("RoE diversity anneal spec cannot be empty.")
+        mode, sep, params_str = spec.partition(":")
+        mode = mode.strip().lower() or "linear"
+        param_map: dict[str, str] = {}
+        if params_str:
+            for item in params_str.split(","):
+                if not item:
+                    continue
+                key, value_sep, value = item.partition("=")
+                if not value_sep:
+                    raise ValueError(
+                        f"Invalid RoE diversity anneal parameter '{item}' in spec '{spec}'.")
+                param_map[key.strip()] = value.strip()
+
+        if mode == "linear":
+            t_start = int(param_map.get("t_start", 0))
+            t_end = int(param_map.get("t_end", t_start))
+            lambda_max = float(param_map.get("lambda_max", self.div_penalty))
+            lambda_min = float(param_map.get("lambda_min", 0.0))
+
+            if t_end < t_start:
+                t_end = t_start
+
+            def schedule(step: int) -> float:
+                if step < t_start:
+                    return lambda_min
+                if step >= t_end or t_end == t_start:
+                    return lambda_max
+                span = max(1, t_end - t_start)
+                alpha = (step - t_start) / span
+                return lambda_min + alpha * (lambda_max - lambda_min)
+
+            return schedule
+
+        raise ValueError(
+            f"Unsupported RoE diversity anneal mode '{mode}' in spec '{spec}'.")
+
+    def _ensure_div_anneal_fn(self) -> Optional[Callable[[int], float]]:
+        if not self.div_anneal:
+            self._div_anneal_fn = None
+            return None
+        if self._div_anneal_fn is None:
+            self._div_anneal_fn = self._build_div_anneal_fn(self.div_anneal)
+        return self._div_anneal_fn
+
+    def get_diversity_lambda(self, step: Optional[int]) -> float:
+        """Return the effective diversity penalty for the given decode step."""
+        base = max(0.0, float(self.div_penalty))
+        if base == 0.0:
+            return 0.0
+        fn = self._ensure_div_anneal_fn()
+        if fn is None:
+            return base
+        if step is None:
+            return base
+        value = float(fn(max(0, int(step))))
+        return max(0.0, value)
+
+
+    def build_runtime_hint(
+        self,
+        enable: Optional[bool],
+        num_samples: Optional[int] = None,
+        tau: Optional[float] = None,
+    ) -> Optional[RoeRuntimeHint]:
+        """Create a RoeRuntimeHint from the provided overrides."""
+        if enable is None:
+            return None
+
+        samples = num_samples if num_samples is not None else self.num_samples
+        if samples is None or samples < 1:
+            samples = 1
+
+        tau_value = tau if tau is not None else (self.taus[0] if self.taus else 0.0)
+
+        if not enable:
+            samples = 1
+            tau_value = 0.0
+
+        return RoeRuntimeHint(enable=bool(enable),
+                              effective_num_samples=int(samples),
+                              effective_tau=float(tau_value))
+
+
+@config
+@dataclass
+class LayerAggConfig:
+    """Configuration for layer-wise aggregation of decoder hidden states."""
+
+    enabled: bool = False
+    """Whether to enable aggregation across the last K layers."""
+    k: int = 4
+    """Number of topmost layers to aggregate."""
+
+    def compute_hash(self) -> str:
+        factors: list[Any] = [self.enabled, self.k]
+        hash_str = hashlib.md5(str(factors).encode(),
+                               usedforsecurity=False).hexdigest()
+        return hash_str
+
+    def __post_init__(self) -> None:
+        if self.k < 1:
+            raise ValueError("layer_agg_k must be >= 1 when enabled.")
+
+    def is_enabled(self) -> bool:
+        return self.enabled and self.k > 0
 
 
 @dataclass
@@ -3773,6 +3953,7 @@ class VllmConfig:
                                                   init=True)  # type: ignore
     kv_transfer_config: KVTransferConfig = field(default=None,
                                                  init=True)  # type: ignore
+    layer_agg_config: Optional[LayerAggConfig] = None
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.
@@ -3838,6 +4019,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.decoding_config:
             vllm_factors.append(self.decoding_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.layer_agg_config:
+            vllm_factors.append(self.layer_agg_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.roe_config:

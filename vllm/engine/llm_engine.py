@@ -4,12 +4,14 @@ import copy
 import json
 import math
 import time
+import uuid
 from pathlib import Path
 from collections import Counter as collectionsCounter
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
+from threading import Lock
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Deque, Dict,
                     Iterable, List, Literal, Mapping, NamedTuple, Optional)
 from typing import Sequence as GenericSequence
@@ -21,8 +23,8 @@ from typing_extensions import TypeVar, deprecated
 import vllm.envs as envs
 from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
                          ObservabilityConfig, ParallelConfig, SchedulerConfig,
-                         VllmConfig)
-from vllm.core.scheduler import ScheduledSequenceGroup, SchedulerOutputs
+                         VllmConfig, RoeRuntimeHint)
+from vllm.core.scheduler import ScheduledSequenceGroup, Scheduler, SchedulerOutputs
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.metrics_types import StatLoggerBase, Stats
 from vllm.engine.output_processor.interfaces import (
@@ -263,6 +265,8 @@ class LLMEngine:
 
         self.log_stats = log_stats
         self.use_cached_outputs = use_cached_outputs
+        self._runtime_roe_hint_lock = Lock()
+        self._runtime_roe_hint: Optional[RoeRuntimeHint] = None
 
         self.token_conf_logger = TokenConfidenceLogger(
             Path('logs/token_confidence.jsonl'))
@@ -947,6 +951,80 @@ class LLMEngine:
         for scheduler in self.scheduler:
             scheduler.abort_seq_group(
                 request_id, seq_id_to_seq_group=self.seq_id_to_seq_group)
+
+    def _find_seq_group_for_request(
+            self, request_id: str) -> tuple[Optional["Scheduler"], Optional[SequenceGroup]]:
+        for scheduler in self.scheduler:
+            for state_queue in (scheduler.waiting, scheduler.running,
+                                scheduler.swapped):
+                for seq_group in state_queue:
+                    real_id = seq_group.request_id
+                    if real_id in self.seq_id_to_seq_group:
+                        real_id = self.seq_id_to_seq_group[real_id].group_id
+                    if request_id == seq_group.request_id or request_id == real_id:
+                        return scheduler, seq_group
+        return None, None
+
+    def _clone_seq_group(
+        self,
+        scheduler,
+        src_group: SequenceGroup,
+        new_request_id: str,
+    ) -> SequenceGroup:
+        new_seqs = []
+        for seq in src_group.get_seqs():
+            child_seq = seq.fork(next(self.seq_counter))
+            child_seq.status = SequenceStatus.WAITING
+            scheduler.fork_seq(seq, child_seq)
+            new_seqs.append(child_seq)
+
+        encoder_seq = None
+        if src_group.encoder_seq is not None:
+            encoder_seq = src_group.encoder_seq.fork(next(self.seq_counter))
+            scheduler.block_manager.fork(src_group.encoder_seq, encoder_seq)
+
+        sampling_params = (copy.deepcopy(src_group.sampling_params)
+                           if src_group.sampling_params is not None else None)
+        new_group = SequenceGroup(
+            request_id=new_request_id,
+            seqs=new_seqs,
+            arrival_time=time.time(),
+            sampling_params=sampling_params,
+            lora_request=src_group.lora_request,
+            pooling_params=src_group.pooling_params,
+            prompt_adapter_request=src_group.prompt_adapter_request,
+            encoder_seq=encoder_seq,
+            trace_headers=src_group.trace_headers,
+            priority=src_group.priority,
+            draft_size=src_group.state.num_steps if src_group.state else 1,
+        )
+        if src_group.state is not None:
+            new_group.state = copy.deepcopy(src_group.state)
+        return new_group
+
+    def abort_requests(self, request_ids: Iterable[str]) -> None:
+        """Batch version of abort_request."""
+        if not request_ids:
+            return
+        for rid in request_ids:
+            self.abort_request(rid)
+
+    def fork_request(self, request_id: str, n: int) -> List[str]:
+        """
+        使用 scheduler/block_manager 在现有请求的 KV 基础上复制出新的 sequence group。
+        """
+        if n <= 0:
+            return []
+        scheduler, seq_group = self._find_seq_group_for_request(request_id)
+        if scheduler is None or seq_group is None:
+            raise ValueError(f"request_id={request_id} 不存在，无法 fork")
+        forked_ids: List[str] = []
+        for _ in range(n):
+            new_request_id = f"{request_id}_fork_{uuid.uuid4().hex[:8]}"
+            clone = self._clone_seq_group(scheduler, seq_group, new_request_id)
+            scheduler.add_seq_group(clone)
+            forked_ids.append(new_request_id)
+        return forked_ids
 
     def get_vllm_config(self) -> VllmConfig:
         """Gets the vllm configuration."""
@@ -1963,6 +2041,34 @@ class LLMEngine:
             max_lora=str(max_lora_stat),
             waiting_lora_adapters=list(waiting_lora_adapters.keys()),
             running_lora_adapters=list(running_lora_adapters.keys()))
+
+    def set_runtime_roe_hint(self, enable: Optional[bool],
+                               K: Optional[int] = None,
+                               tau: Optional[float] = None) -> None:
+        """Override RoE behaviour for subsequent decode steps.
+
+        Passing ``enable=None`` clears any runtime override and restores the
+        static configuration provided at engine startup.
+
+        Args:
+            enable: ``True`` to enable RoE, ``False`` to force-disable,
+                ``None`` to clear overrides.
+            K: Number of samples to replicate when enabled. Ignored when
+                ``enable`` is ``False`` or ``None``.
+            tau: Temperature to apply when enabled. Ignored when ``enable``
+                is ``False`` or ``None``.
+        """
+        roe_config = getattr(self.vllm_config, "roe_config", None)
+        if roe_config is None:
+            logger.debug("set_runtime_roe_hint ignored: RoeConfig unavailable.")
+            return
+
+        hint = roe_config.build_runtime_hint(enable, K, tau)
+
+        with self._runtime_roe_hint_lock:
+            self._runtime_roe_hint = hint
+        roe_config.set_runtime_hint(hint)
+        self.model_executor.collective_rpc("set_runtime_roe_hint", args=(hint, ))
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_executor.add_lora(lora_request)

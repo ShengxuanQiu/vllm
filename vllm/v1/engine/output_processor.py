@@ -100,6 +100,8 @@ class RequestState:
         self.max_tokens_param = max_tokens_param
         self.is_prefilling = True
         self.queue = queue
+        self.num_cached_tokens = 0
+        self.conf_list_cursor = 0
 
         self.stats = RequestStateStats(
             arrival_time=arrival_time) if log_stats else None
@@ -211,6 +213,16 @@ class RequestState:
         if delta and logprobs:
             logprobs = logprobs[-len(token_ids):]
 
+        conf_delta = None
+        conf_list = getattr(self.logprobs_processor, 'conf_list', None)
+        if conf_list is not None:
+            if len(conf_list) < getattr(self, 'conf_list_cursor', 0):
+                self.conf_list_cursor = 0
+            cursor = getattr(self, 'conf_list_cursor', 0)
+            if len(conf_list) > cursor:
+                conf_delta = conf_list[cursor:]
+                self.conf_list_cursor = len(conf_list)
+
         return CompletionOutput(
             index=self.request_index,
             text=text,
@@ -218,7 +230,8 @@ class RequestState:
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
-            stop_reason=stop_reason if finished else None)
+            stop_reason=stop_reason if finished else None,
+            confidence_values=conf_delta)
 
 
 class OutputProcessor:

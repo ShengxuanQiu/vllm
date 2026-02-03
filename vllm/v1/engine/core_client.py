@@ -120,6 +120,11 @@ class EngineCoreClient(ABC):
     def pin_lora(self, lora_id: int) -> bool:
         raise NotImplementedError
 
+    def set_runtime_roe_hint(self, enable: Optional[bool],
+                               K: Optional[int] = None,
+                               tau: Optional[float] = None) -> None:
+        raise NotImplementedError
+
     def save_sharded_state(self,
                            path: str,
                            pattern: Optional[str] = None,
@@ -167,6 +172,13 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def pin_lora_async(self, lora_id: int) -> bool:
+        raise NotImplementedError
+
+    async def set_runtime_roe_hint_async(
+            self,
+            enable: Optional[bool],
+            K: Optional[int] = None,
+            tau: Optional[float] = None) -> None:
         raise NotImplementedError
 
     async def save_sharded_state_async(self,
@@ -239,6 +251,11 @@ class InprocClient(EngineCoreClient):
 
     def pin_lora(self, lora_id: int) -> bool:
         return self.engine_core.pin_lora(lora_id)
+
+    def set_runtime_roe_hint(self, enable: Optional[bool],
+                               K: Optional[int] = None,
+                               tau: Optional[float] = None) -> None:
+        self.engine_core.set_runtime_roe_hint(enable, K, tau)
 
     def save_sharded_state(self,
                            path: str,
@@ -607,6 +624,12 @@ class SyncMPClient(MPClient):
     def pin_lora(self, lora_id: int) -> bool:
         return self.call_utility("pin_lora", lora_id)
 
+    def set_runtime_roe_hint(self,
+                             enable: Optional[bool],
+                             K: Optional[int] = None,
+                             tau: Optional[float] = None) -> None:
+        self.call_utility("set_runtime_roe_hint", enable, K, tau)
+
     def sleep(self, level: int = 1) -> None:
         self.call_utility("sleep", level)
 
@@ -805,6 +828,13 @@ class AsyncMPClient(MPClient):
 
     async def pin_lora_async(self, lora_id: int) -> bool:
         return await self.call_utility_async("pin_lora", lora_id)
+
+    async def set_runtime_roe_hint_async(
+            self,
+            enable: Optional[bool],
+            K: Optional[int] = None,
+            tau: Optional[float] = None) -> None:
+        await self.call_utility_async("set_runtime_roe_hint", enable, K, tau)
 
     async def save_sharded_state_async(self,
                                        path: str,
