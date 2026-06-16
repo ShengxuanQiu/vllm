@@ -36,6 +36,8 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.mas_trace import emit as mas_trace_emit
+from vllm.mas_trace import summarize_scheduler_output
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -960,6 +962,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        mas_trace_start = time.time()
+        mas_trace_batch = summarize_scheduler_output(scheduler_output)
         if not dummy_run:
             # Update the request states.
             self.finish_requests(scheduler_output)
@@ -998,6 +1002,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
+            mas_trace_emit(
+                "model_execute_batch",
+                **mas_trace_batch,
+                duration_sec=round(time.time() - mas_trace_start, 6),
+                dummy_run=dummy_run,
+                is_profile=is_profile,
+                skipped_forward=True,
+                batch_num_tokens=0,
+                batch_num_requests=0,
+                dp_rank=self.dp_rank,
+                dp_size=self.dp_size,
+            )
             return empty_output
 
         if not dummy_run:
@@ -1130,6 +1146,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_intermediate_tensors = model_output
 
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
+        mas_trace_emit(
+            "model_execute_batch",
+            **mas_trace_batch,
+            duration_sec=round(time.time() - mas_trace_start, 6),
+            dummy_run=dummy_run,
+            is_profile=is_profile,
+            skipped_forward=False,
+            batch_num_tokens=batch_desc.num_tokens,
+            batch_num_requests=batch_desc.num_reqs,
+            cudagraph_mode=str(batch_desc.cg_mode),
+            dp_rank=self.dp_rank,
+            dp_size=self.dp_size,
+        )
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,

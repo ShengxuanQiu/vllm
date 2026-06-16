@@ -27,6 +27,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.mas_trace import emit as mas_trace_emit
+from vllm.mas_trace import summarize_kv_event, summarize_scheduler_output
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsReader,
 )
@@ -955,6 +957,15 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        mas_trace_emit(
+            "scheduler_batch",
+            **summarize_scheduler_output(scheduler_output),
+            waiting_queue_size=len(self.waiting),
+            running_queue_size=len(self.running),
+            token_budget_remaining=token_budget,
+            max_num_scheduled_tokens=self.max_num_scheduled_tokens,
+            max_num_running_requests=self.max_num_running_reqs,
+        )
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1527,6 +1538,13 @@ class Scheduler(SchedulerInterface):
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
+            for event in events:
+                mas_trace_emit(
+                    "kv_cache_event",
+                    **summarize_kv_event(event),
+                    event_batch_ts=batch.ts,
+                    evidence_scope="scheduler_observed",
+                )
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
